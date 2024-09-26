@@ -1,6 +1,7 @@
 syntax = "proto3";
 
-package hivemapper.types.v1;
+package test;
+option go_package = "test.pb";
 
 message Entity {
   oneof Item {
@@ -21,8 +22,6 @@ message Transaction {
 }
 
 message Output {
-  uint64 block_number = 1;
-  uint64 block_hash = 2;
   repeated Transaction transactions = 3;
 }
 

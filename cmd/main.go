@@ -3,13 +3,16 @@ package main
 import (
 	"database/sql"
 	"fmt"
-	"log"
 	"os"
+	test_pb "substreams-sink-map-sql/pb"
 	sql2 "substreams-sink-map-sql/sql"
+	"time"
 
 	"github.com/jhump/protoreflect/desc/protoparse"
 	_ "github.com/lib/pq"
 	"github.com/streamingfast/logging"
+	sink "github.com/streamingfast/substreams-sink"
+	"google.golang.org/protobuf/proto"
 )
 
 type PsqlInfo struct {
@@ -32,7 +35,7 @@ func main() {
 	logger, _ := logging.ApplicationLogger("honey-tracker", "honey-tracker")
 
 	// Path to your .proto file
-	protoFile := "/Users/cbillett/devel/sf/substreams-sink-map-sql/cmd/test.proto"
+	protoFile := "/Users/cbillett/devel/sf/substreams-sink-map-sql/proto/test.proto"
 
 	// Create a new parser
 	parser := protoparse.Parser{}
@@ -40,7 +43,7 @@ func main() {
 	// Parse the .proto file to get descriptors
 	fds, err := parser.ParseFiles(protoFile)
 	if err != nil {
-		log.Fatalf("Failed to parse .proto file: %v", err)
+		panic(fmt.Sprintf("Failed to parse .proto file: %v", err))
 	}
 
 	// fds is a []*desc.FileDescriptor, we take the first one for simplicity
@@ -59,16 +62,48 @@ func main() {
 
 	psqlDB, err := sql.Open("postgres", psqlInfo.GetPsqlInfo())
 	if err != nil {
-		log.Fatalf("Failed to connect to database: %v", err)
+		panic(fmt.Sprintf("Failed to connect to database: %v", err))
 	}
 
-	_, err = sql2.NewDatabase(&sql2.Schema{
+	database, err := sql2.NewDatabase(&sql2.Schema{
 		Name:    "foo",
 		Version: 1,
-	}, psqlDB, fileDesc, logger)
+	}, psqlDB, "test.Output", fileDesc, logger)
 
 	if err != nil {
 		panic(fmt.Errorf("failed to create database: %w", err))
 	}
 
+	blankCursor, err := sink.NewCursor("")
+	if err != nil {
+		panic(fmt.Errorf("failed to create cursor: %w", err))
+	}
+
+	output := &test_pb.Output{
+		Transactions: []*test_pb.Transaction{
+			{
+				TrxHash: "tx.hash.1",
+				Entities: []*test_pb.Entity{
+					{
+						Item: &test_pb.Entity_Payment{
+							&test_pb.Payment{
+								Mint: &test_pb.Mint{
+									Timestamp: 0,
+									To:        "to.hash.1",
+									Amount:    10,
+								},
+								Type: test_pb.PaymentType_FLEET_MANAGER,
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	data, err := proto.Marshal(output)
+	err = database.ProcessEntity(data, 1, "block.hash.1", time.Now(), blankCursor)
+	if err != nil {
+		panic(fmt.Errorf("failed to process entity: %w", err))
+	}
 }

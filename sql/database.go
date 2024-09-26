@@ -3,47 +3,19 @@ package sql
 import (
 	"database/sql"
 	"fmt"
+	"reflect"
 	"strings"
+	"time"
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
+	sink "github.com/streamingfast/substreams-sink"
 	"go.uber.org/zap"
 )
 
-// todo: database create schema
-const static_sql = `
-	CREATE TABLE IF NOT EXISTS hivemapper.cursor (
-		name TEXT PRIMARY KEY,
-		cursor TEXT NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS hivemapper.blocks (
-		id SERIAL PRIMARY KEY,
-		number INTEGER NOT NULL,
-		hash TEXT NOT NULL,
-		timestamp TIMESTAMP NOT NULL
-	);
-
-	CREATE TABLE IF NOT EXISTS hivemapper.transactions (
-		id SERIAL PRIMARY KEY,
-		block_id INTEGER NOT NULL,
-		hash TEXT NOT NULL UNIQUE,
-		CONSTRAINT fk_block FOREIGN KEY (block_id) REFERENCES hivemapper.blocks(id)
-	);
-`
-
-type Schema struct {
-	Name                  string
-	Version               int
-	tableCreateStatements []string
-}
-
-func (s *Schema) String() string {
-	return fmt.Sprintf("%s_%d", s.Name, s.Version)
-}
-
 type Database struct {
+	context          *Context
 	schema           *Schema
 	db               *sql.DB
 	tx               *sql.Tx
@@ -53,16 +25,19 @@ type Database struct {
 	descriptor       *desc.FileDescriptor
 }
 
+//todo: handle schema change with version and start block
+
 func NewDatabase(schema *Schema, db *sql.DB, mapOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Database, error) {
 	err := generateTablesCreate(schema, descriptor)
 	if err != nil {
 		return nil, fmt.Errorf("generating create queries: %w", err)
 	}
 
-	_, err = db.Exec(static_sql)
+	_, err = db.Exec(fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String(), schema.String(), schema.String()))
 	if err != nil {
 		return nil, fmt.Errorf("executing static sql: %w", err)
 	}
+	fmt.Println("static sql executed")
 
 	for _, statement := range schema.tableCreateStatements {
 		_, err = db.Exec(statement)
@@ -70,6 +45,7 @@ func NewDatabase(schema *Schema, db *sql.DB, mapOutputType string, descriptor *d
 			return nil, fmt.Errorf("executing create statement: %w %s", err, statement)
 		}
 	}
+	fmt.Println("table create statements executed")
 
 	statements, err := generateStatements(schema, db, descriptor)
 	if err != nil {
@@ -115,12 +91,15 @@ func (d *Database) RollbackTransaction() error {
 	return nil
 }
 
-func (d *Database) ProcessEntity(data []byte) (err error) {
+func (d *Database) ProcessEntity(data []byte, blockNum uint64, blockHash string, blockTimestamp time.Time, cursor *sink.Cursor) (err error) {
 	defer func() {
 		if err != nil {
 			if d.tx != nil {
 				e := d.tx.Rollback()
-				err = fmt.Errorf("rolling back transaction: %w", e)
+				if e != nil {
+					err = fmt.Errorf("rolling back transaction: %w", e)
+				}
+				err = fmt.Errorf("processing entity: %w", err)
 			}
 			return
 		}
@@ -150,35 +129,63 @@ func (d *Database) ProcessEntity(data []byte) (err error) {
 		return fmt.Errorf("unmarshaling message: %w", err)
 	}
 
+	err = d.processMessage(msg, blockNum, blockHash, blockTimestamp)
+	if err != nil {
+		return fmt.Errorf("processing message: %w", err)
+	}
+
+	err = d.insertCursor(cursor)
+	if err != nil {
+		return fmt.Errorf("inserting cursor: %w", err)
+	}
+
 	return nil
 }
 
-func (d *Database) processMessage(md *dynamic.Message) error {
-	//todo: create some kind context to keep block id trx id for future use.
+func (d *Database) processMessage(md *dynamic.Message, blockNum uint64, blockHash string, blockTimestamp time.Time) error {
 	//todo: add transaction id to all entity tables
 
-	blockNum := md.GetFieldByName("block_number").(int64)
-	blockHash := md.GetFieldByName("block_hash").(string)
+	err := d.insertBlock(blockNum, blockHash, blockTimestamp)
+	if err != nil {
+		return fmt.Errorf("inserting block: %w", err)
+	}
 
-	//todo: insert block and get the ID back
+	interfaces := md.GetFieldByName("transactions").([]interface{})
 
-	transactions := md.GetFieldByName("transactions").([]*dynamic.Message)
+	for _, i := range interfaces {
+		transaction, ok := i.(*dynamic.Message)
+		trxHash, ok := transaction.GetFieldByName("trx_hash").(string)
+		if !ok {
+			return fmt.Errorf("field trx_hash is not a string")
+		}
 
-	for _, transaction := range transactions {
-		trxHash := transaction.GetFieldByName("trx_hash").(string)
-		//todo: insert transaction and get the ID back
+		err := d.insertTransaction(trxHash)
+		if err != nil {
+			return fmt.Errorf("inserting transaction: %w", err)
+		}
 
-		entities := transaction.GetFieldByName("entities").([]*dynamic.Message)
-		for _, entity := range entities {
+		interfaces := transaction.GetFieldByName("entities").([]interface{})
+		for _, i := range interfaces {
+			entity, ok := i.(*dynamic.Message)
+			if !ok {
+				return fmt.Errorf("field entities is not a message")
+			}
 			for _, fd := range entity.GetKnownFields() {
 				if fd.GetType() != descriptor.FieldDescriptorProto_TYPE_MESSAGE {
 					return fmt.Errorf("field %s is not a message", fd.GetName())
 				}
-				fv := md.GetField(fd)
+				fv := entity.GetField(fd)
+
+				if reflect.ValueOf(fv).IsNil() {
+					continue
+				}
+
 				fm, ok := fv.(*dynamic.Message)
 				if !ok {
-					return fmt.Errorf("field %s is not a message", fd.GetName())
+					return fmt.Errorf("field %s is not a message but %t", fd.GetName(), fv)
 				}
+
+				_ = fm
 				_, err := d.walkMessageDescriptorAndInsert(fd.GetType().String(), fm)
 				if err != nil {
 					return fmt.Errorf("walking message descriptor %q: %w", fd.GetName(), err)
@@ -191,8 +198,14 @@ func (d *Database) processMessage(md *dynamic.Message) error {
 }
 
 func (d *Database) walkMessageDescriptorAndInsert(protoType string, md *dynamic.Message) (int, error) {
-	stmt := d.insertStatements[protoType]
+	key := strings.ToLower(md.GetMessageDescriptor().GetName())
+	stmt, found := d.insertStatements[key]
+	if !found {
+		return 0, fmt.Errorf("statement not found for %s", protoType)
+	}
+
 	var fieldValues []any
+	fieldValues = append(fieldValues, d.context.dbTransactionID)
 	for _, fd := range md.GetKnownFields() {
 		fv := md.GetField(fd)
 		if fm, ok := fv.(*dynamic.Message); ok {
@@ -201,19 +214,79 @@ func (d *Database) walkMessageDescriptorAndInsert(protoType string, md *dynamic.
 				return 0, fmt.Errorf("walking nested message descriptor %q: %w", fd.GetName(), err)
 			}
 			fieldValues = append(fieldValues, id)
+		} else {
+			fieldValues = append(fieldValues, fv)
 		}
 	}
 
 	row := d.tx.Stmt(stmt).QueryRow(fieldValues...)
 	err := row.Err()
 	if err != nil {
-		return 0, fmt.Errorf("inserting %q: %w", protoType, err)
+		return 0, fmt.Errorf("inserting %s: %w", stmt, err)
 	}
 
 	var id int
 	err = row.Scan(&id)
 
 	return id, err
+}
+
+func (d *Database) insertBlock(num uint64, hash string, timestamp time.Time) error {
+	stmt := d.insertStatements["block"]
+	row := d.tx.Stmt(stmt).QueryRow(num, hash, timestamp)
+
+	err := row.Err()
+	if err != nil {
+		return fmt.Errorf("inserting %q block: %w", stmt, err)
+	}
+
+	var id int
+	err = row.Scan(&id)
+
+	d.context = NewContext() //also act as a reset
+	d.context.SetDBBlockID(id)
+	return err
+}
+
+func (d *Database) insertTransaction(trxHash string) error {
+	stmt := d.insertStatements["transaction"]
+	row := d.tx.Stmt(stmt).QueryRow(d.context.dbBlockID, trxHash)
+
+	err := row.Err()
+	if err != nil {
+		return fmt.Errorf("db inserting transaction: %w", err)
+	}
+	var id int
+	err = row.Scan(&id)
+	d.context.SetDBTransactionID(id)
+	return err
+}
+
+func (d *Database) insertCursor(cursor *sink.Cursor) error {
+	stmt := d.insertStatements["cursor"]
+	_, err := d.tx.Stmt(stmt).Exec("map-sinker", cursor.String())
+
+	if err != nil {
+		return fmt.Errorf("inserting cursor: %w", err)
+	}
+
+	return err
+}
+
+func (d *Database) FetchCursor() (*sink.Cursor, error) {
+	rows, err := d.db.Query(fmt.Sprintf("SELECT cursor FROM %s WHERE name = $1", TableName(d.schema, "cursor")), "hivemapper")
+	if err != nil {
+		return nil, fmt.Errorf("selecting cursor: %w", err)
+	}
+	defer rows.Close()
+
+	if rows.Next() {
+		var cursor string
+		err = rows.Scan(&cursor)
+
+		return sink.NewCursor(cursor)
+	}
+	return nil, nil
 }
 
 func generateTablesCreate(schema *Schema, fileDescriptor *desc.FileDescriptor) error {
@@ -275,12 +348,13 @@ func (f *foreignKey) String() string {
 func createTableFromMessageDescriptor(schema *Schema, messageDescriptor *desc.MessageDescriptor) (string, error) {
 	var sb strings.Builder
 
-	table := tableName(schema, messageDescriptor)
+	table := tableNameFromDescriptor(schema, messageDescriptor)
 	sb.WriteString(fmt.Sprintf("CREATE TABLE  IF NOT EXISTS %s (\n", table))
 	sb.WriteString("    id SERIAL PRIMARY KEY,\n")
+	sb.WriteString("    transaction_id INTEGER NOT NULL,\n")
 
 	var foreignKeys []*foreignKey
-	for i, f := range messageDescriptor.GetFields() {
+	for _, f := range messageDescriptor.GetFields() {
 		field := fieldQuotedName(f)
 		fieldType := mapFieldType(f)
 
@@ -291,19 +365,16 @@ func createTableFromMessageDescriptor(schema *Schema, messageDescriptor *desc.Me
 				name:         "fk_" + fieldName(f),
 				table:        table,
 				field:        field,
-				foreignTable: tableName(schema, f.GetMessageType()),
+				foreignTable: tableNameFromDescriptor(schema, f.GetMessageType()),
 				foreignField: "id",
 			})
 		}
 
-		if i < len(messageDescriptor.GetFields())-1 || foreignKeys != nil {
-			sb.WriteString(",\n")
-		} else {
-			sb.WriteString("\n")
-		}
+		sb.WriteString(",\n")
 	}
-
+	sb.WriteString(fmt.Sprintf("    CONSTRAINT fk_transaction FOREIGN KEY (transaction_id) REFERENCES %s.block(id)", schema.String()))
 	for i, key := range foreignKeys {
+		sb.WriteString(",\n")
 		sb.WriteString("    " + key.String())
 		if i < len(foreignKeys)-1 {
 			sb.WriteString(",\n")
@@ -343,18 +414,41 @@ func mapFieldType(field *desc.FieldDescriptor) string {
 
 func generateStatements(schema *Schema, db *sql.DB, fileDescriptor *desc.FileDescriptor) (map[string]*sql.Stmt, error) {
 	statements := map[string]*sql.Stmt{}
+
+	insertBlock, err := db.Prepare(fmt.Sprintf("INSERT INTO %s (number, hash, timestamp) VALUES ($1, $2, $3) RETURNING id", TableName(schema, "block")))
+	if err != nil {
+		panic(err)
+	}
+
+	statements["block"] = insertBlock
+
+	insertTransaction, err := db.Prepare(fmt.Sprintf("INSERT INTO %s (block_id, hash) VALUES ($1, $2) RETURNING id", TableName(schema, "transaction")))
+	if err != nil {
+		panic(err)
+	}
+
+	statements["transaction"] = insertTransaction
+
+	insertCursor, err := db.Prepare(fmt.Sprintf("INSERT INTO %s (name, cursor) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET cursor = $2", TableName(schema, "cursor")))
+	if err != nil {
+		panic(err)
+	}
+
+	statements["cursor"] = insertCursor
+
 	for _, messageDescriptor := range fileDescriptor.GetMessageTypes() {
 		if messageDescriptor.GetName() == "Entity" {
 
 			for _, fieldDescriptor := range messageDescriptor.GetFields() {
-				fmt.Println("fieldDescriptor: ", fieldDescriptor.GetName(), fieldDescriptor.GetType(), fieldDescriptor.GetMessageType())
 				if fieldDescriptor.GetType() == descriptor.FieldDescriptorProto_TYPE_MESSAGE {
 					msgDesc := fieldDescriptor.GetMessageType()
 					stmt, err := statementFromMessageDescriptor(schema, db, msgDesc)
 					if err != nil {
 						return nil, fmt.Errorf("creating statement from message fileDescriptor: %w", err)
 					}
-					statements[messageDescriptor.GetName()] = stmt
+					key := strings.ToLower(msgDesc.GetName())
+					fmt.Println("mapping statement with name ", key)
+					statements[key] = stmt
 				}
 			}
 		}
@@ -364,10 +458,9 @@ func generateStatements(schema *Schema, db *sql.DB, fileDescriptor *desc.FileDes
 
 func statementFromMessageDescriptor(schema *Schema, db *sql.DB, descriptor *desc.MessageDescriptor) (*sql.Stmt, error) {
 	insert := createInsertSQL(schema, descriptor)
-	fmt.Println("insert: ", insert)
 	stmt, err := db.Prepare(insert)
 	if err != nil {
-		return nil, fmt.Errorf("preparing insert statement: %w", err)
+		return nil, fmt.Errorf("preparing insert statement %q: %w", insert, err)
 	}
 	return stmt, nil
 }
@@ -375,12 +468,15 @@ func statementFromMessageDescriptor(schema *Schema, db *sql.DB, descriptor *desc
 func createInsertSQL(schema *Schema, d *desc.MessageDescriptor) string {
 	tableName := schema.String() + "." + strings.ToLower(d.GetName())
 	fields := d.GetFields()
-	fieldNames := make([]string, len(fields))
-	placeholders := make([]string, len(fields))
+	var fieldNames = make([]string, len(fields)+1)
+	placeholders := make([]string, len(fields)+1)
+
+	fieldNames[0] = "transaction_id"
+	placeholders[0] = "$1"
 
 	for i, field := range fields {
-		fieldNames[i] = fieldQuotedName(field)
-		placeholders[i] = fmt.Sprintf("$%d", i+1)
+		fieldNames[i+1] = fieldQuotedName(field)
+		placeholders[i+1] = fmt.Sprintf("$%d", i+2)
 	}
 
 	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id",
@@ -391,8 +487,12 @@ func createInsertSQL(schema *Schema, d *desc.MessageDescriptor) string {
 	return insertSQL
 }
 
-func tableName(schema *Schema, d *desc.MessageDescriptor) string {
-	return schema.String() + "." + strings.ToLower(d.GetName())
+func tableNameFromDescriptor(schema *Schema, d *desc.MessageDescriptor) string {
+	return TableName(schema, d.GetName())
+}
+
+func TableName(schema *Schema, name string) string {
+	return schema.String() + "." + strings.ToLower(name)
 }
 
 func fieldName(f *desc.FieldDescriptor) string {
