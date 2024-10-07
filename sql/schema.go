@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"substreams-sink-map-sql/proto"
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
@@ -31,6 +32,7 @@ type Schema struct {
 	Name                  string
 	Version               int
 	tableCreateStatements []string
+	constraintStatements  []string
 	insertSql             map[string]string
 	manyToOneRelations    map[string][]string
 	moduleOutputType      string
@@ -70,8 +72,8 @@ func (s *Schema) init() error {
 			err := s.walkMessageDescriptor(messageDescriptor, func(messageDescriptor *desc.MessageDescriptor) error {
 				//extract relation
 				for _, f := range messageDescriptor.GetFields() {
-					if f.IsRepeated() {
-						s.AddManyToOneRelation(f.GetFullyQualifiedName(), messageDescriptor.GetName())
+					if f.IsRepeated() && proto.IsTable(messageDescriptor) {
+						s.AddManyToOneRelation(f.GetMessageType().GetFullyQualifiedName(), messageDescriptor.GetName())
 					}
 				}
 				return nil
@@ -134,6 +136,10 @@ func (s *Schema) walkMessageDescriptor(messageDescriptor *desc.MessageDescriptor
 }
 
 func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
+	if !proto.IsTable(d) {
+		return nil
+	}
+
 	tableName := s.String() + "." + strings.ToLower(d.GetName())
 	fields := d.GetFields()
 	var fieldNames []string
@@ -171,6 +177,10 @@ func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
 }
 
 func (s *Schema) createTableFromMessageDescriptor(messageDescriptor *desc.MessageDescriptor) error {
+	if !proto.IsTable(messageDescriptor) {
+		return nil
+	}
+
 	var sb strings.Builder
 
 	table := tableNameFromDescriptor(s, messageDescriptor)
@@ -178,57 +188,58 @@ func (s *Schema) createTableFromMessageDescriptor(messageDescriptor *desc.Messag
 	sb.WriteString("    id SERIAL PRIMARY KEY,\n")
 	sb.WriteString("    block_number INTEGER NOT NULL,\n")
 
-	var foreignKeys []*foreignKey
 	for _, f := range messageDescriptor.GetFields() {
 		field := fieldQuotedName(f)
 		fieldType := mapFieldType(f)
 
-		sb.WriteString(fmt.Sprintf("    %s %s", field, fieldType))
-
 		switch {
+		case f.IsRepeated():
+			continue
 		case f.GetType() == descriptor.FieldDescriptorProto_TYPE_MESSAGE:
-			foreignKeys = append(foreignKeys, &foreignKey{
+			if !proto.IsTable(f.GetMessageType()) {
+				continue
+			}
+			foreignKey := &foreignKey{
 				name:         "fk_" + fieldName(f),
 				table:        table,
 				field:        field,
 				foreignTable: tableNameFromDescriptor(s, f.GetMessageType()),
 				foreignField: "id",
-			})
-		case f.IsRepeated():
-			continue
+			}
+			s.constraintStatements = append(s.constraintStatements, foreignKey.String())
 		}
-
+		sb.WriteString(fmt.Sprintf("    %s %s", field, fieldType))
 		sb.WriteString(",\n")
 	}
 
+	temp := sb.String()
+	temp = temp[:len(temp)-2]
+	sb = strings.Builder{}
+	sb.WriteString(temp)
+
 	ones := s.manyToOneRelations[messageDescriptor.GetFullyQualifiedName()]
-	for _, one := range ones {
-		field := fmt.Sprintf("%s_id", one)
+	for i, one := range ones {
+		sb.WriteString(",\n")
+		field := fmt.Sprintf("%s_id", strings.ToLower(one))
 		fieldType := "INTEGER"
 		sb.WriteString(fmt.Sprintf("    %s %s", field, fieldType))
-		foreignKeys = append(foreignKeys, &foreignKey{
+
+		if i < len(ones)-1 {
+			sb.WriteString(",\n")
+		}
+
+		foreignKey := &foreignKey{
 			name:         "fk_" + field,
 			table:        table,
 			field:        field,
 			foreignTable: TableName(s, one),
 			foreignField: "id",
-		})
-	}
-
-	sb.WriteString(fmt.Sprintf("    CONSTRAINT fk_block FOREIGN KEY (block_number) REFERENCES %s.block(number)", s.String()))
-	if len(foreignKeys) > 0 {
-		sb.WriteString(",\n")
-	}
-	for i, key := range foreignKeys {
-		sb.WriteString("    " + key.String())
-		if i < len(foreignKeys)-1 {
-			sb.WriteString(",\n")
-		} else {
-			sb.WriteString("\n")
 		}
+		s.constraintStatements = append(s.constraintStatements, foreignKey.String())
 	}
+	sb.WriteString("\n);\n")
 
-	sb.WriteString(");")
+	s.constraintStatements = append(s.constraintStatements, fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT fk_block FOREIGN KEY (block_number) REFERENCES %s.block(number)", table, s.String()))
 
 	s.tableCreateStatements = append(s.tableCreateStatements, sb.String())
 	return nil
@@ -276,7 +287,7 @@ type foreignKey struct {
 }
 
 func (f *foreignKey) String() string {
-	return fmt.Sprintf("CONSTRAINT %s  FOREIGN KEY (%s) REFERENCES %s(%s)", f.name, f.field, f.foreignTable, f.foreignField)
+	return fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT %s  FOREIGN KEY (%s) REFERENCES %s(%s)", f.table, f.name, f.field, f.foreignTable, f.foreignField)
 }
 
 func mapFieldType(field *desc.FieldDescriptor) string {

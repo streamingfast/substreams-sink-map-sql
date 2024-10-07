@@ -78,6 +78,7 @@ func main() {
 	}
 
 	output := &test_pb.Transactions{
+		Foo: "toto",
 		Transactions: []*test_pb.Transaction{
 			{
 				TrxHash: "tx.hash.1",
@@ -91,6 +92,20 @@ func main() {
 									Amount:    10,
 								},
 								Type: test_pb.PaymentType_FLEET_MANAGER,
+							},
+						},
+					},
+				},
+			}, {
+				TrxHash: "tx.hash.2",
+				Entities: []*test_pb.Entity{
+					{
+						Item: &test_pb.Entity_Transfers{
+							&test_pb.Transfer{
+								Timestamp: 0,
+								From:      "from.hash.1",
+								To:        "to.hash.1",
+								Amount:    99,
 							},
 						},
 					},

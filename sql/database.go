@@ -3,10 +3,10 @@ package sql
 import (
 	"database/sql"
 	"fmt"
-	"reflect"
+	"strings"
+	"substreams-sink-map-sql/proto"
 	"time"
 
-	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	sink "github.com/streamingfast/substreams-sink"
@@ -140,47 +140,23 @@ func (d *Database) processMessage(md *dynamic.Message, blockNum uint64, blockHas
 	if err != nil {
 		return fmt.Errorf("inserting block: %w", err)
 	}
-
-	for _, fd := range md.GetKnownFields() {
-		if fd.GetType() != descriptor.FieldDescriptorProto_TYPE_MESSAGE {
-			return fmt.Errorf("field %s is not a message", fd.GetName())
-		}
-		fv := md.GetField(fd)
-
-		if reflect.ValueOf(fv).IsNil() {
-			continue
-		}
-
-		fi, ok := fv.([]interface{})
-		if !ok {
-			return fmt.Errorf("field %s is not a message but %t", fd.GetName(), fv)
-		}
-
-		fm := fi[0].(*dynamic.Message)
-		_, err := d.walkMessageDescriptorAndInsert(fd.GetType().String(), fm)
-		if err != nil {
-			return fmt.Errorf("walking message descriptor %q: %w", fd.GetName(), err)
-		}
+	_, err = d.walkMessageDescriptorAndInsert(md, nil)
+	if err != nil {
+		return fmt.Errorf("walking message descriptor %q: %w", md.GetMessageDescriptor().GetFullyQualifiedName(), err)
 	}
 	return nil
 }
 
-func (d *Database) walkMessageDescriptorAndInsert(protoType string, md *dynamic.Message) (int, error) {
-	key := md.GetMessageDescriptor().GetFullyQualifiedName()
-	stmt, found := d.insertStatements[key]
-	if !found {
-		return 0, fmt.Errorf("statement not found for key %q", key)
-	}
-
+func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *Parent) (id int, err error) {
 	var fieldValues []any
 	fieldValues = append(fieldValues, d.context.blockNumber)
 	var childs [][]interface{}
-	for _, fd := range md.GetKnownFields() {
-		fv := md.GetField(fd)
+	for _, fd := range dm.GetKnownFields() {
+		fv := dm.GetField(fd)
 		if v, ok := fv.([]interface{}); ok {
 			childs = append(childs, v)
 		} else if fm, ok := fv.(*dynamic.Message); ok {
-			id, err := d.walkMessageDescriptorAndInsert(fd.GetType().String(), fm)
+			id, err = d.walkMessageDescriptorAndInsert(fm, nil)
 			if err != nil {
 				return 0, fmt.Errorf("walking nested message descriptor %q: %w", fd.GetName(), err)
 			}
@@ -190,14 +166,33 @@ func (d *Database) walkMessageDescriptorAndInsert(protoType string, md *dynamic.
 		}
 	}
 
-	row := d.tx.Stmt(stmt).QueryRow(fieldValues...)
-	err := row.Err()
-	if err != nil {
-		return 0, fmt.Errorf("inserting %s: %w", stmt, err)
+	if parent != nil {
+		fieldValues = append(fieldValues, parent.id)
 	}
 
-	var id int
-	err = row.Scan(&id)
+	md := dm.GetMessageDescriptor()
+	id = -1
+	var p *Parent
+	if proto.IsTable(md) {
+		key := md.GetFullyQualifiedName()
+		stmt, found := d.insertStatements[key]
+		if !found {
+			return 0, fmt.Errorf("insert statement not found for key %q", key)
+		}
+
+		row := d.tx.Stmt(stmt).QueryRow(fieldValues...)
+		err = row.Err()
+		if err != nil {
+			return 0, fmt.Errorf("inserting %s: %w", stmt, err)
+		}
+
+		err = row.Scan(&id)
+
+		p = &Parent{
+			field: strings.ToLower(md.GetName()),
+			id:    id,
+		}
+	}
 
 	for _, child := range childs {
 		for _, c := range child {
@@ -205,14 +200,19 @@ func (d *Database) walkMessageDescriptorAndInsert(protoType string, md *dynamic.
 			if !ok {
 				panic("expected *dynamic.Message")
 			}
-			_, err := d.walkMessageDescriptorAndInsert(fm.GetMessageDescriptor().GetFullyQualifiedName(), fm)
+			_, err = d.walkMessageDescriptorAndInsert(fm, p)
 			if err != nil {
-				return 0, fmt.Errorf("walking nested message descriptor %q: %w", fm.GetMessageDescriptor().GetFullyQualifiedName(), err)
+				return 0, fmt.Errorf("processing child %q: %w", fm.GetMessageDescriptor().GetFullyQualifiedName(), err)
 			}
 		}
 	}
 
 	return id, err
+}
+
+type Parent struct {
+	field string
+	id    int
 }
 
 func (d *Database) insertBlock(num uint64, hash string, timestamp time.Time) error {
