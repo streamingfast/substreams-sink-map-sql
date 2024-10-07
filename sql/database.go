@@ -7,6 +7,8 @@ import (
 	"substreams-sink-map-sql/proto"
 	"time"
 
+	"github.com/lib/pq"
+
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	sink "github.com/streamingfast/substreams-sink"
@@ -33,12 +35,26 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 	fmt.Println("static sql executed")
 
 	for _, statement := range schema.tableCreateStatements {
-		_, err = db.Exec(statement)
+		_, err := db.Exec(statement)
 		if err != nil {
 			return nil, fmt.Errorf("executing create statement: %w %s", err, statement)
 		}
+
 	}
 	fmt.Println("table create statements executed")
+
+	for _, constraint := range schema.constraintStatements {
+		fmt.Println("executing constraint statement: ", constraint.sql)
+		_, err = db.Exec(constraint.sql)
+		if err != nil {
+			if e, ok := err.(*pq.Error); ok {
+				if e.Code == "42710" {
+					continue
+				}
+			}
+			return nil, fmt.Errorf("executing constraint statement: %w %s", err, constraint.sql)
+		}
+	}
 
 	inserts, err := generateInsertStatements(schema, db)
 	if err != nil {

@@ -1,10 +1,7 @@
 package sql
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"sort"
 	"strings"
 	"substreams-sink-map-sql/proto"
 
@@ -28,11 +25,16 @@ CREATE TABLE IF NOT EXISTS "%s".cursor (
 	);
 `
 
+type constraint struct {
+	table string
+	sql   string
+}
+
 type Schema struct {
 	Name                  string
 	Version               int
-	tableCreateStatements []string
-	constraintStatements  []string
+	tableCreateStatements map[string]string
+	constraintStatements  []*constraint
 	insertSql             map[string]string
 	manyToOneRelations    map[string][]string
 	moduleOutputType      string
@@ -41,12 +43,13 @@ type Schema struct {
 
 func NewSchema(name string, version int, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Schema, error) {
 	s := &Schema{
-		Name:               name,
-		Version:            version,
-		moduleOutputType:   moduleOutputType,
-		fileDescriptor:     descriptor,
-		insertSql:          make(map[string]string),
-		manyToOneRelations: make(map[string][]string),
+		Name:                  name,
+		Version:               version,
+		moduleOutputType:      moduleOutputType,
+		fileDescriptor:        descriptor,
+		insertSql:             make(map[string]string),
+		manyToOneRelations:    make(map[string][]string),
+		tableCreateStatements: make(map[string]string),
 	}
 
 	err := s.init()
@@ -181,9 +184,15 @@ func (s *Schema) createTableFromMessageDescriptor(messageDescriptor *desc.Messag
 		return nil
 	}
 
+	if _, found := s.tableCreateStatements[messageDescriptor.GetFullyQualifiedName()]; found {
+		return nil
+	}
+
 	var sb strings.Builder
 
 	table := tableNameFromDescriptor(s, messageDescriptor)
+	fmt.Println("creating create sql for:", table)
+
 	sb.WriteString(fmt.Sprintf("CREATE TABLE  IF NOT EXISTS %s (\n", table))
 	sb.WriteString("    id SERIAL PRIMARY KEY,\n")
 	sb.WriteString("    block_number INTEGER NOT NULL,\n")
@@ -206,7 +215,11 @@ func (s *Schema) createTableFromMessageDescriptor(messageDescriptor *desc.Messag
 				foreignTable: tableNameFromDescriptor(s, f.GetMessageType()),
 				foreignField: "id",
 			}
-			s.constraintStatements = append(s.constraintStatements, foreignKey.String())
+			c := &constraint{
+				table: table,
+				sql:   foreignKey.String(),
+			}
+			s.constraintStatements = append(s.constraintStatements, c)
 		}
 		sb.WriteString(fmt.Sprintf("    %s %s", field, fieldType))
 		sb.WriteString(",\n")
@@ -235,13 +248,23 @@ func (s *Schema) createTableFromMessageDescriptor(messageDescriptor *desc.Messag
 			foreignTable: TableName(s, one),
 			foreignField: "id",
 		}
-		s.constraintStatements = append(s.constraintStatements, foreignKey.String())
+		c := &constraint{
+			table: table,
+			sql:   foreignKey.String(),
+		}
+
+		s.constraintStatements = append(s.constraintStatements, c)
 	}
 	sb.WriteString("\n);\n")
 
-	s.constraintStatements = append(s.constraintStatements, fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT fk_block FOREIGN KEY (block_number) REFERENCES %s.block(number)", table, s.String()))
+	c := &constraint{
+		table: table,
+		sql:   fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT fk_block FOREIGN KEY (block_number) REFERENCES %s.block(number)", table, s.String()),
+	}
 
-	s.tableCreateStatements = append(s.tableCreateStatements, sb.String())
+	s.constraintStatements = append(s.constraintStatements, c)
+
+	s.tableCreateStatements[messageDescriptor.GetFullyQualifiedName()] = sb.String()
 	return nil
 
 }
@@ -255,23 +278,24 @@ func (s *Schema) AddManyToOneRelation(many string, one string) {
 }
 
 func (s *Schema) Hash() string {
-	h := sha256.New()
-
-	// Add the Name to the hash
-	h.Write([]byte(s.Name))
-
-	// Add the Version to the hash
-	h.Write([]byte(fmt.Sprintf("%d", s.Version)))
-
-	// Add the tableCreateStatements to the hash in a sorted order for consistent hashing
-	sortedStatements := make([]string, len(s.tableCreateStatements))
-	copy(sortedStatements, s.tableCreateStatements)
-	sort.Strings(sortedStatements)
-	for _, stmt := range sortedStatements {
-		h.Write([]byte(stmt))
-	}
-
-	return hex.EncodeToString(h.Sum(nil))
+	panic("fix me")
+	//h := sha256.New()
+	//
+	//// Add the Name to the hash
+	//h.Write([]byte(s.Name))
+	//
+	//// Add the Version to the hash
+	//h.Write([]byte(fmt.Sprintf("%d", s.Version)))
+	//
+	//// Add the tableCreateStatements to the hash in a sorted order for consistent hashing
+	//sortedStatements := make([]string, len(s.tableCreateStatements))
+	//copy(sortedStatements, s.tableCreateStatements)
+	//sort.Strings(sortedStatements)
+	//for _, stmt := range sortedStatements {
+	//	h.Write([]byte(stmt))
+	//}
+	//
+	//return hex.EncodeToString(h.Sum(nil))
 }
 
 func (s *Schema) String() string {
