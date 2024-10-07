@@ -65,10 +65,8 @@ func main() {
 		panic(fmt.Sprintf("Failed to connect to database: %v", err))
 	}
 
-	database, err := sql2.NewDatabase(&sql2.Schema{
-		Name:    "foo",
-		Version: 1,
-	}, psqlDB, "test.Output", fileDesc, logger)
+	schema, err := sql2.NewSchema("foo", 1, "test.Transactions", fileDesc, logger)
+	database, err := sql2.NewDatabase(schema, psqlDB, "test.Transactions", fileDesc, logger)
 
 	if err != nil {
 		panic(fmt.Errorf("failed to create database: %w", err))
@@ -79,7 +77,7 @@ func main() {
 		panic(fmt.Errorf("failed to create cursor: %w", err))
 	}
 
-	output := &test_pb.Output{
+	output := &test_pb.Transactions{
 		Transactions: []*test_pb.Transaction{
 			{
 				TrxHash: "tx.hash.1",

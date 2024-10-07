@@ -1,26 +1,17 @@
 package sql
 
 type Context struct {
-	dbBlockID       int
-	dbTransactionID int
+	blockNumber int
 }
 
 func NewContext() *Context {
 	return &Context{}
 }
 
-func (c *Context) SetDBBlockID(id int) {
-	c.dbBlockID = id
+func (c *Context) SetNumber(id int) {
+	c.blockNumber = id
 }
 
-func (c *Context) SetDBTransactionID(id int) {
-	c.dbTransactionID = id
-}
-
-func (c *Context) DBBlockID() int {
-	return c.dbBlockID
-}
-
-func (c *Context) DBTransactionID() int {
-	return c.dbTransactionID
+func (c *Context) BlockNumber() int {
+	return c.blockNumber
 }
