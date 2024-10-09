@@ -7,10 +7,9 @@ import (
 	"substreams-sink-map-sql/proto"
 	"time"
 
-	"github.com/lib/pq"
-
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
+	"github.com/lib/pq"
 	sink "github.com/streamingfast/substreams-sink"
 	"go.uber.org/zap"
 )
@@ -27,12 +26,12 @@ type Database struct {
 }
 
 // todo: handle schema change with version and start block
+
 func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Database, error) {
 	_, err := db.Exec(fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String()))
 	if err != nil {
 		return nil, fmt.Errorf("executing static sql: %w", err)
 	}
-	fmt.Println("static sql executed")
 
 	for _, statement := range schema.tableCreateStatements {
 		_, err := db.Exec(statement)
@@ -41,14 +40,13 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 		}
 
 	}
-	fmt.Println("table create statements executed")
 
 	for _, constraint := range schema.constraintStatements {
 		fmt.Println("executing constraint statement: ", constraint.sql)
 		_, err = db.Exec(constraint.sql)
 		if err != nil {
 			if e, ok := err.(*pq.Error); ok {
-				if e.Code == "42710" {
+				if e.Code == "42710" { //constraint already exist. This suck since it is Pq specific
 					continue
 				}
 			}
@@ -56,7 +54,7 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 		}
 	}
 
-	inserts, err := generateInsertStatements(schema, db)
+	insertStatements, err := generateInsertStatements(schema, db)
 	if err != nil {
 		return nil, fmt.Errorf("generating insertSql: %w", err)
 	}
@@ -67,7 +65,7 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 		logger:           logger,
 		mapOutputType:    moduleOutputType,
 		descriptor:       descriptor,
-		insertStatements: inserts,
+		insertStatements: insertStatements,
 	}, nil
 }
 
@@ -117,7 +115,6 @@ func (d *Database) ProcessEntity(data []byte, blockNum uint64, blockHash string,
 		}
 
 		d.tx = nil
-
 	}()
 
 	tx, err := d.db.Begin()
@@ -127,18 +124,18 @@ func (d *Database) ProcessEntity(data []byte, blockNum uint64, blockHash string,
 	d.tx = tx
 
 	// Find the message descriptor in the file descriptor
-	md := d.descriptor.FindMessage(d.mapOutputType) //output
+	md := d.descriptor.FindMessage(d.mapOutputType)
 	if md == nil {
 		return fmt.Errorf("message descriptor not found for %s", d.mapOutputType)
 	}
 
-	msg := dynamic.NewMessage(md)
-	err = msg.Unmarshal(data)
+	dm := dynamic.NewMessage(md)
+	err = dm.Unmarshal(data)
 	if err != nil {
 		return fmt.Errorf("unmarshaling message: %w", err)
 	}
 
-	err = d.processMessage(msg, blockNum, blockHash, blockTimestamp)
+	err = d.processMessage(dm, blockNum, blockHash, blockTimestamp)
 	if err != nil {
 		return fmt.Errorf("processing message: %w", err)
 	}
@@ -151,14 +148,14 @@ func (d *Database) ProcessEntity(data []byte, blockNum uint64, blockHash string,
 	return nil
 }
 
-func (d *Database) processMessage(md *dynamic.Message, blockNum uint64, blockHash string, blockTimestamp time.Time) error {
+func (d *Database) processMessage(dm *dynamic.Message, blockNum uint64, blockHash string, blockTimestamp time.Time) error {
 	err := d.insertBlock(blockNum, blockHash, blockTimestamp)
 	if err != nil {
 		return fmt.Errorf("inserting block: %w", err)
 	}
-	_, err = d.walkMessageDescriptorAndInsert(md, nil)
+	_, err = d.walkMessageDescriptorAndInsert(dm, nil)
 	if err != nil {
-		return fmt.Errorf("walking message descriptor %q: %w", md.GetMessageDescriptor().GetFullyQualifiedName(), err)
+		return fmt.Errorf("processing message %q: %w", dm.GetMessageDescriptor().GetFullyQualifiedName(), err)
 	}
 	return nil
 }
@@ -166,11 +163,12 @@ func (d *Database) processMessage(md *dynamic.Message, blockNum uint64, blockHas
 func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *Parent) (id int, err error) {
 	var fieldValues []any
 	fieldValues = append(fieldValues, d.context.blockNumber)
+
 	var childs [][]interface{}
 	for _, fd := range dm.GetKnownFields() {
 		fv := dm.GetField(fd)
 		if v, ok := fv.([]interface{}); ok {
-			childs = append(childs, v)
+			childs = append(childs, v) //need to be handled after current message inserted
 		} else if fm, ok := fv.(*dynamic.Message); ok {
 			id, err = d.walkMessageDescriptorAndInsert(fm, nil)
 			if err != nil {
@@ -231,13 +229,13 @@ type Parent struct {
 	id    int
 }
 
-func (d *Database) insertBlock(num uint64, hash string, timestamp time.Time) error {
+func (d *Database) insertBlock(blockNum uint64, hash string, timestamp time.Time) error {
 	stmt := d.insertStatements["block"]
-	row := d.tx.Stmt(stmt).QueryRow(num, hash, timestamp)
+	row := d.tx.Stmt(stmt).QueryRow(blockNum, hash, timestamp)
 
 	err := row.Err()
 	if err != nil {
-		return fmt.Errorf("inserting %q block: %w", stmt, err)
+		return fmt.Errorf("inserting block %d: %w", blockNum, err)
 	}
 
 	var id int
