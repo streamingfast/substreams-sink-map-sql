@@ -3,6 +3,7 @@ package sql
 import (
 	"database/sql"
 	"fmt"
+	"runtime/debug"
 	"strings"
 	"substreams-sink-map-sql/proto"
 	"time"
@@ -99,7 +100,17 @@ func (d *Database) RollbackTransaction() error {
 }
 
 func (d *Database) ProcessEntity(data []byte, blockNum uint64, blockHash string, blockTimestamp time.Time, cursor *sink.Cursor) (err error) {
+	d.logger.Debug("processing entity", zap.Uint64("block_num", blockNum), zap.String("block_hash", blockHash))
 	defer func() {
+		if r := recover(); r != nil {
+			e := d.tx.Rollback()
+			if e != nil {
+				panic(e)
+			}
+			fmt.Println("stacktrace from panic: \n" + string(debug.Stack()))
+			err = fmt.Errorf("recovering from panic: %v", r)
+			return
+		}
 		if err != nil {
 			if d.tx != nil {
 				e := d.tx.Rollback()
@@ -164,12 +175,20 @@ func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *P
 	var fieldValues []any
 	fieldValues = append(fieldValues, d.context.blockNumber)
 
+	if dm == nil {
+		return 0, fmt.Errorf("received a nil message")
+	}
+
 	var childs [][]interface{}
 	for _, fd := range dm.GetKnownFields() {
 		fv := dm.GetField(fd)
 		if v, ok := fv.([]interface{}); ok {
 			childs = append(childs, v) //need to be handled after current message inserted
 		} else if fm, ok := fv.(*dynamic.Message); ok {
+			if fm == nil {
+				fieldValues = append(fieldValues, nil)
+				continue //un-use oneOf field
+			}
 			id, err = d.walkMessageDescriptorAndInsert(fm, nil)
 			if err != nil {
 				return 0, fmt.Errorf("walking nested message descriptor %q: %w", fd.GetName(), err)
@@ -197,7 +216,8 @@ func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *P
 		row := d.tx.Stmt(stmt).QueryRow(fieldValues...)
 		err = row.Err()
 		if err != nil {
-			return 0, fmt.Errorf("inserting %s: %w", stmt, err)
+			insert := d.schema.insertSql[dm.GetMessageDescriptor().GetFullyQualifiedName()]
+			return 0, fmt.Errorf("inserting %q: %w", insert, err)
 		}
 
 		err = row.Scan(&id)
@@ -248,7 +268,7 @@ func (d *Database) insertBlock(blockNum uint64, hash string, timestamp time.Time
 
 func (d *Database) insertCursor(cursor *sink.Cursor) error {
 	stmt := d.insertStatements["cursor"]
-	_, err := d.tx.Stmt(stmt).Exec("map-sinker", cursor.String())
+	_, err := d.tx.Stmt(stmt).Exec("cursor", cursor.String())
 
 	if err != nil {
 		return fmt.Errorf("inserting cursor: %w", err)
@@ -258,7 +278,7 @@ func (d *Database) insertCursor(cursor *sink.Cursor) error {
 }
 
 func (d *Database) FetchCursor() (*sink.Cursor, error) {
-	rows, err := d.db.Query(fmt.Sprintf("SELECT cursor FROM %s WHERE name = $1", TableName(d.schema, "cursor")), "hivemapper")
+	rows, err := d.db.Query(fmt.Sprintf("SELECT cursor FROM %s WHERE name = $1", TableName(d.schema, "cursor")), "cursor")
 	if err != nil {
 		return nil, fmt.Errorf("selecting cursor: %w", err)
 	}
@@ -271,6 +291,45 @@ func (d *Database) FetchCursor() (*sink.Cursor, error) {
 		return sink.NewCursor(cursor)
 	}
 	return nil, nil
+}
+
+func (d *Database) HandleBlocksUndo(lastValidBlockNum uint64, cursor *sink.Cursor) (err error) {
+	defer func() {
+		if err != nil {
+			if d.tx != nil {
+				e := d.tx.Rollback()
+				if e != nil {
+					err = fmt.Errorf("HandleBlocksUndo rolling back transaction: %w", e)
+				}
+				err = fmt.Errorf("HandleBlocksUndo processing entity: %w", err)
+			}
+			return
+		}
+		if d.tx != nil {
+			err = d.tx.Commit()
+		}
+
+		d.tx = nil
+	}()
+
+	tx, err := d.db.Begin()
+	if err != nil {
+		return fmt.Errorf("HandleBlocksUndo beginning transaction: %w", err)
+	}
+	d.tx = tx
+
+	query := fmt.Sprintf(`DELETE CASCADE FROM %s.block WHERE "number" > $1`, d.schema.String())
+	_, err = d.tx.Exec(query, lastValidBlockNum)
+	if err != nil {
+		return fmt.Errorf("deleting block from %d: %w", lastValidBlockNum, err)
+	}
+
+	err = d.insertCursor(cursor)
+	if err != nil {
+		return fmt.Errorf("store cursor: %w", err)
+	}
+
+	return nil
 }
 
 func generateInsertStatements(schema *Schema, db *sql.DB) (map[string]*sql.Stmt, error) {
