@@ -12,8 +12,6 @@ import (
 	sql2 "substreams-sink-map-sql/sql"
 	"time"
 
-	"google.golang.org/protobuf/types/descriptorpb"
-
 	"github.com/jhump/protoreflect/desc"
 	"github.com/spf13/cobra"
 	"github.com/streamingfast/bstream"
@@ -22,6 +20,7 @@ import (
 	sink "github.com/streamingfast/substreams-sink"
 	"github.com/streamingfast/substreams/client"
 	"go.uber.org/zap"
+	"google.golang.org/protobuf/types/descriptorpb"
 )
 
 type PsqlInfo struct {
@@ -102,7 +101,7 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		"",
 		nil,
 		outputModuleName,
-		"hivemapper.types.v1.Transactions",
+		"",
 		false,
 		"",
 		logger,
@@ -138,23 +137,32 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating sink: %w", err)
 	}
 
+	outputType := ""
+	for _, m := range spkg.Modules.Modules {
+		if m.Name == outputModuleName {
+			outputType = strings.TrimPrefix(m.Output.Type, "proto:")
+			break
+		}
+	}
+
 	deps := map[string]*desc.FileDescriptor{}
-	err = resolveDependencies(spkg.ProtoFiles, "hivemapper/v1/hivemapper.proto", deps)
+	err = resolveDependencies(spkg.ProtoFiles, "", deps)
 	if err != nil {
 		return fmt.Errorf("resolving dependencies: %w", err)
 	}
 
 	var fd *desc.FileDescriptor
 	for _, p := range spkg.ProtoFiles {
-		if *p.Name != "hivemapper/v1/hivemapper.proto" {
-			continue
-		}
-
 		fd, err = desc.CreateFileDescriptor(p, slices.Collect(maps.Values(deps))...)
 		if err != nil {
 			return fmt.Errorf("creating file descriptor: %w", err)
 		}
-		break
+
+		for _, md := range fd.GetMessageTypes() {
+			if md.GetName() == outputType {
+				break
+			}
+		}
 	}
 
 	if fd == nil {
@@ -172,14 +180,6 @@ func rootRun(cmd *cobra.Command, args []string) error {
 	db, err := sql.Open("postgres", psqlInfo.GetPsqlInfo())
 	if err != nil {
 		return fmt.Errorf("failed to connect to database: %w", err)
-	}
-
-	outputType := ""
-	for _, m := range spkg.Modules.Modules {
-		if m.Name == outputModuleName {
-			outputType = strings.TrimPrefix(m.Output.Type, "proto:")
-			break
-		}
 	}
 
 	if outputType == "" {
@@ -216,22 +216,20 @@ func resolveDependencies(fds []*descriptorpb.FileDescriptorProto, fileName strin
 	}
 
 	for _, fd := range fds {
-		if fileName == fd.GetName() {
-			if len(fd.Dependency) != 0 {
-				for _, dep := range fd.Dependency {
-					err := resolveDependencies(fds, dep, deps)
-					if err != nil {
-						return err
-					}
+		if len(fd.Dependency) != 0 {
+			for _, dep := range fd.Dependency {
+				err := resolveDependencies(fds, dep, deps)
+				if err != nil {
+					return err
 				}
 			}
-
-			d, err := desc.CreateFileDescriptor(fd, slices.Collect(maps.Values(deps))...)
-			if err != nil {
-				return fmt.Errorf("creating file descriptor: %w", err)
-			}
-			deps[fd.GetName()] = d
 		}
+
+		d, err := desc.CreateFileDescriptor(fd, slices.Collect(maps.Values(deps))...)
+		if err != nil {
+			return fmt.Errorf("creating file descriptor: %w", err)
+		}
+		deps[fd.GetName()] = d
 	}
 	return nil
 }
