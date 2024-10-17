@@ -7,8 +7,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-	"substreams-sink-map-sql/data"
-	sql2 "substreams-sink-map-sql/sql"
 	"time"
 
 	"github.com/jhump/protoreflect/desc"
@@ -17,6 +15,8 @@ import (
 	"github.com/streamingfast/cli/sflags"
 	"github.com/streamingfast/logging"
 	sink "github.com/streamingfast/substreams-sink"
+	"github.com/streamingfast/substreams-sink-map-sql/data"
+	sql2 "github.com/streamingfast/substreams-sink-map-sql/sql"
 	"github.com/streamingfast/substreams/client"
 	v1 "github.com/streamingfast/substreams/pb/sf/substreams/v1"
 	"go.uber.org/zap"

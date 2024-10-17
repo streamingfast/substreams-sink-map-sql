@@ -1,4 +1,4 @@
-module substreams-sink-map-sql
+module github.com/streamingfast/substreams-sink-map-sql
 
 go 1.23.1
 
