@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"database/sql"
 	"fmt"
 	"maps"
@@ -19,6 +18,7 @@ import (
 	"github.com/streamingfast/logging"
 	sink "github.com/streamingfast/substreams-sink"
 	"github.com/streamingfast/substreams/client"
+	v1 "github.com/streamingfast/substreams/pb/sf/substreams/v1"
 	"go.uber.org/zap"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
@@ -68,6 +68,7 @@ func main() {
 }
 
 func rootRun(cmd *cobra.Command, args []string) error {
+
 	apiToken := os.Getenv("SUBSTREAMS_API_TOKEN")
 	if apiToken == "" {
 		return fmt.Errorf("missing SUBSTREAMS_API_TOKEN environment variable")
@@ -88,7 +89,7 @@ func rootRun(cmd *cobra.Command, args []string) error {
 	startBlock := sflags.MustGetUint64(cmd, "start-block")
 	stopBlock := sflags.MustGetUint64(cmd, "start-block")
 
-	clientConfig := client.NewSubstreamsClientConfig(
+	substreamsClientConfig := client.NewSubstreamsClientConfig(
 		endpoint,
 		apiToken,
 		client.JWT,
@@ -96,16 +97,7 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		flagPlaintext,
 	)
 
-	spkg, module, outputModuleHash, br, err := sink.ReadManifestAndModuleAndBlockRange(
-		manifestPath,
-		"",
-		nil,
-		outputModuleName,
-		"",
-		false,
-		"",
-		logger,
-	)
+	spkg, module, outputModuleHash, br, err := sink.ReadManifestAndModuleAndBlockRange(manifestPath, "", nil, outputModuleName, "", false, "", logger)
 	if err != nil {
 		return fmt.Errorf("reading manifest: %w", err)
 	}
@@ -122,27 +114,14 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		options = append(options, sink.WithBlockRange(blockRange))
 	}
 
-	s, err := sink.New(
-		sink.SubstreamsModeProduction,
-		false,
-		spkg,
-		module,
-		outputModuleHash,
-		clientConfig,
-		logger,
-		tracer,
-		options...,
-	)
+	s, err := sink.New(sink.SubstreamsModeProduction, false, spkg, module, outputModuleHash, substreamsClientConfig, logger, tracer, options...)
 	if err != nil {
 		return fmt.Errorf("creating sink: %w", err)
 	}
 
-	outputType := ""
-	for _, m := range spkg.Modules.Modules {
-		if m.Name == outputModuleName {
-			outputType = strings.TrimPrefix(m.Output.Type, "proto:")
-			break
-		}
+	outputType := moduleOutputType(spkg, outputModuleName)
+	if outputType == "" {
+		return fmt.Errorf("could not find output type for module %s", outputModuleName)
 	}
 
 	deps := map[string]*desc.FileDescriptor{}
@@ -151,22 +130,9 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("resolving dependencies: %w", err)
 	}
 
-	var fd *desc.FileDescriptor
-	for _, p := range spkg.ProtoFiles {
-		fd, err = desc.CreateFileDescriptor(p, slices.Collect(maps.Values(deps))...)
-		if err != nil {
-			return fmt.Errorf("creating file descriptor: %w", err)
-		}
-
-		for _, md := range fd.GetMessageTypes() {
-			if md.GetName() == outputType {
-				break
-			}
-		}
-	}
-
-	if fd == nil {
-		return fmt.Errorf("could not find file descriptor")
+	fd, err := fileDescriptorForOutputType(spkg, err, deps, outputType)
+	if err != nil {
+		return fmt.Errorf("finding file descriptor for output type %q: %w", outputType, err)
 	}
 
 	psqlInfo := &PsqlInfo{
@@ -182,10 +148,6 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	if outputType == "" {
-		return fmt.Errorf("could not find output type for module %s", outputModuleName)
-	}
-
 	schema, err := sql2.NewSchema("myschema", 1, outputType, fd, logger)
 	if err != nil {
 		return fmt.Errorf("creating schema: %w", err)
@@ -196,18 +158,49 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("creating database: %w", err)
 	}
 
-	ctx := context.Background()
 	sinker := data.NewSinker(logger, s, database)
 	sinker.OnTerminating(func(err error) {
 		logger.Error("sinker terminating", zap.Error(err))
 	})
 
-	err = sinker.Run(ctx)
+	err = sinker.Run(cmd.Context())
 	if err != nil {
 		return fmt.Errorf("runnning sinker:%w", err)
 	}
 
 	return nil
+}
+
+func fileDescriptorForOutputType(spkg *v1.Package, err error, deps map[string]*desc.FileDescriptor, outputType string) (*desc.FileDescriptor, error) {
+	var fd *desc.FileDescriptor
+	for _, p := range spkg.ProtoFiles {
+		fd, err = desc.CreateFileDescriptor(p, slices.Collect(maps.Values(deps))...)
+		if err != nil {
+			return nil, fmt.Errorf("creating file descriptor: %w", err)
+		}
+
+		for _, md := range fd.GetMessageTypes() {
+			if md.GetName() == outputType {
+				break
+			}
+		}
+	}
+
+	if fd == nil {
+		return nil, fmt.Errorf("could not find file descriptor")
+	}
+	return fd, nil
+}
+
+func moduleOutputType(spkg *v1.Package, moduleName string) string {
+	outputType := ""
+	for _, m := range spkg.Modules.Modules {
+		if m.Name == moduleName {
+			outputType = strings.TrimPrefix(m.Output.Type, "proto:")
+			break
+		}
+	}
+	return outputType
 }
 
 func resolveDependencies(fds []*descriptorpb.FileDescriptorProto, fileName string, deps map[string]*desc.FileDescriptor) error {
