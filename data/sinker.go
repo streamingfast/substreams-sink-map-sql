@@ -3,10 +3,10 @@ package data
 import (
 	"context"
 	"fmt"
-	"substreams-sink-map-sql/sql"
 	"time"
 
 	sink "github.com/streamingfast/substreams-sink"
+	"github.com/streamingfast/substreams-sink-map-sql/sql"
 	pbsubstreamsrpc "github.com/streamingfast/substreams/pb/sf/substreams/rpc/v2"
 	v1 "github.com/streamingfast/substreams/pb/sf/substreams/v1"
 	"go.uber.org/zap"

@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"runtime/debug"
 	"strings"
-	"substreams-sink-map-sql/proto"
 	"time"
 
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/dynamic"
 	"github.com/lib/pq"
 	sink "github.com/streamingfast/substreams-sink"
+	"github.com/streamingfast/substreams-sink-map-sql/proto"
 	"go.uber.org/zap"
 )
 
@@ -26,8 +26,6 @@ type Database struct {
 	insertStatements map[string]*sql.Stmt
 }
 
-// todo: handle schema change with version and start block
-
 func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Database, error) {
 	_, err := db.Exec(fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String()))
 	if err != nil {
@@ -39,7 +37,6 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 		if err != nil {
 			return nil, fmt.Errorf("executing create statement: %w %s", err, statement)
 		}
-
 	}
 
 	for _, constraint := range schema.constraintStatements {

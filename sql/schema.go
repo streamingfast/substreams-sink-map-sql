@@ -4,10 +4,10 @@ import (
 	"fmt"
 	"hash/fnv"
 	"strings"
-	"substreams-sink-map-sql/proto"
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
+	"github.com/streamingfast/substreams-sink-map-sql/proto"
 	"go.uber.org/zap"
 )
 
