@@ -2,35 +2,32 @@ package proto
 
 import (
 	"errors"
+	"fmt"
 
 	proto "github.com/golang/protobuf/proto"
 	"github.com/jhump/protoreflect/desc"
+	"github.com/streamingfast/substreams-sink-map-sql/pb/schema"
 	"google.golang.org/protobuf/types/descriptorpb"
 )
 
-func IsTable(d *desc.MessageDescriptor) bool {
+func TableInfo(d *desc.MessageDescriptor) *schema.Table {
 	msgOptions := d.GetOptions().(*descriptorpb.MessageOptions)
 
-	var E_IsTable = &proto.ExtensionDesc{
-		ExtendedType:  (*descriptorpb.MessageOptions)(nil),
-		ExtensionType: (*bool)(nil),
-		Field:         77701,
-		Name:          "is_table",
-		Tag:           "varint,77701,opt,name=is_table",
-	}
-
-	ext, err := proto.GetExtension(msgOptions, E_IsTable)
+	ext, err := proto.GetExtension(msgOptions, schema.E_Table)
 
 	if errors.Is(err, proto.ErrMissingExtension) {
-		return false
+		return nil
 	} else if err != nil {
-		return false
+		return nil
 	} else {
-		isTable, ok := ext.(*bool)
-		if ok && *isTable {
-			return true
+		table, ok := ext.(*schema.Table)
+		if ok {
+			if table.Name == "" {
+				panic(fmt.Sprintf("table name is required for message %q", d.GetName()))
+			}
+			return table
 		} else {
-			return false
+			return nil
 		}
 	}
 }

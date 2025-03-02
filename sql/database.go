@@ -27,12 +27,15 @@ type Database struct {
 }
 
 func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Database, error) {
-	_, err := db.Exec(fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String()))
+	logger = logger.Named("database")
+	statucSql := fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String(), schema.String())
+	_, err := db.Exec(statucSql)
 	if err != nil {
-		return nil, fmt.Errorf("executing static sql: %w", err)
+		return nil, fmt.Errorf("executing static statucSql: %w\n%s", err, statucSql)
 	}
 
 	for _, statement := range schema.tableCreateStatements {
+		logger.Info("executing create statement", zap.String("sql", statement))
 		_, err := db.Exec(statement)
 		if err != nil {
 			return nil, fmt.Errorf("executing create statement: %w %s", err, statement)
@@ -40,7 +43,7 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 	}
 
 	for _, constraint := range schema.constraintStatements {
-		fmt.Println("executing constraint statement: ", constraint.sql)
+		logger.Info("executing constraint statement", zap.String("sql", constraint.sql))
 		_, err = db.Exec(constraint.sql)
 		if err != nil {
 			if e, ok := err.(*pq.Error); ok {
@@ -65,6 +68,18 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 		descriptor:       descriptor,
 		insertStatements: insertStatements,
 	}, nil
+}
+
+func getSchemaHash(db *sql.DB, schema *Schema) (string, error) {
+	var hash string
+	err := db.QueryRow(fmt.Sprintf("SELECT hash FROM %s.sink_info", schema.Name)).Scan(&hash)
+	if err != nil {
+		return "", fmt.Errorf("fetching schema hash: %w", err)
+	}
+	if hash != schema.String() {
+		return "", fmt.Errorf("schema hash mismatch: %s != %s", hash, schema.String())
+	}
+	return hash, nil
 }
 
 func (d *Database) BeginTransaction() error {
@@ -203,7 +218,8 @@ func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *P
 	md := dm.GetMessageDescriptor()
 	id = -1
 	var p *Parent
-	if proto.IsTable(md) {
+	t := proto.TableInfo(md)
+	if t != nil {
 		key := md.GetFullyQualifiedName()
 		stmt, found := d.insertStatements[key]
 		if !found {

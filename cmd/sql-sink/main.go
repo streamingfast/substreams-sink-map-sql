@@ -55,6 +55,7 @@ func init() {
 	RootCmd.Flags().Int("db-port", 5432, "PostgreSQL port")
 	RootCmd.Flags().String("db-user", "postgres", "PostgreSQL user")
 	RootCmd.Flags().String("db-name", "postgres", "PostgreSQL database name")
+	RootCmd.Flags().String("db-schema", "my_schema", "database schema name")
 	RootCmd.Flags().Uint64("start-block", 0, "start block number (0 means no start block)")
 	RootCmd.Flags().Uint64("stop-block", 0, "stop block number (0 means no stop block)")
 	RootCmd.Flags().Duration("startup-delay", time.Duration(0), "stop block number (0 means no stop block)")
@@ -148,7 +149,8 @@ func rootRun(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to connect to database: %w", err)
 	}
 
-	schema, err := sql2.NewSchema("myschema", 1, outputType, fd, logger)
+	schemaName := sflags.MustGetString(cmd, "db-schema")
+	schema, err := sql2.NewSchema(schemaName, outputType, fd, logger)
 	if err != nil {
 		return fmt.Errorf("creating schema: %w", err)
 	}

@@ -8,10 +8,6 @@ import (
 	"github.com/jhump/protoreflect/desc"
 )
 
-func tableNameFromDescriptor(schema *Schema, d *desc.MessageDescriptor) string {
-	return TableName(schema, d.GetName())
-}
-
 func TableName(schema *Schema, name string) string {
 	return schema.String() + "." + strings.ToLower(name)
 }
@@ -26,5 +22,9 @@ func fieldName(f *desc.FieldDescriptor) string {
 }
 
 func fieldQuotedName(f *desc.FieldDescriptor) string {
-	return fmt.Sprintf("\"%s\"", fieldName(f))
+	return Quoted(fieldName(f))
+}
+
+func Quoted(value string) string {
+	return fmt.Sprintf("\"%s\"", value)
 }

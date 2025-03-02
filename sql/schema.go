@@ -7,14 +7,19 @@ import (
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
+	"github.com/streamingfast/substreams-sink-map-sql/pb/schema"
 	"github.com/streamingfast/substreams-sink-map-sql/proto"
 	"go.uber.org/zap"
 )
 
 const static_sql = `
 	CREATE SCHEMA IF NOT EXISTS "%s";
-	
-CREATE TABLE IF NOT EXISTS "%s".cursor (
+
+	CREATE TABLE IF NOT EXISTS "%s".sink_info (
+		hash TEXT PRIMARY KEY
+	);
+
+	CREATE TABLE IF NOT EXISTS "%s".cursor (
 		name TEXT PRIMARY KEY,
 		cursor TEXT NOT NULL
 	);
@@ -28,23 +33,21 @@ CREATE TABLE IF NOT EXISTS "%s".cursor (
 
 type Schema struct {
 	Name                  string
-	Version               int
 	tableCreateStatements map[string]string
 	constraintStatements  []*Constraint
 	insertSql             map[string]string
-	manyToOneRelations    map[string][]string
+	manyToOneRelations    map[string][]*schema.Table
 	moduleOutputType      string
 	fileDescriptor        *desc.FileDescriptor
 }
 
-func NewSchema(name string, version int, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Schema, error) {
+func NewSchema(name string, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Schema, error) {
 	s := &Schema{
 		Name:                  name,
-		Version:               version,
 		moduleOutputType:      moduleOutputType,
 		fileDescriptor:        descriptor,
 		insertSql:             make(map[string]string),
-		manyToOneRelations:    make(map[string][]string),
+		manyToOneRelations:    make(map[string][]*schema.Table),
 		tableCreateStatements: make(map[string]string),
 	}
 
@@ -70,8 +73,9 @@ func (s *Schema) init() error {
 
 			err := s.walkMessageDescriptor(messageDescriptor, func(md *desc.MessageDescriptor) error {
 				for _, f := range md.GetFields() {
-					if f.IsRepeated() && proto.IsTable(md) {
-						s.AddManyToOneRelation(f.GetMessageType().GetFullyQualifiedName(), md.GetName())
+					t := proto.TableInfo(md)
+					if f.IsRepeated() && t != nil {
+						s.AddManyToOneRelation(f.GetMessageType().GetFullyQualifiedName(), t)
 					}
 				}
 				return nil
@@ -134,17 +138,19 @@ func (s *Schema) walkMessageDescriptor(md *desc.MessageDescriptor, task func(md 
 }
 
 func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) error {
-	if !proto.IsTable(md) {
+	t := proto.TableInfo(md)
+	isTable := t != nil
+	if !isTable {
 		return nil
 	}
 
-	if _, found := s.tableCreateStatements[md.GetFullyQualifiedName()]; found {
+	if _, found := s.tableCreateStatements[t.Name]; found {
 		return nil
 	}
 
 	var sb strings.Builder
 
-	tableName := tableNameFromDescriptor(s, md)
+	tableName := TableName(s, t.Name)
 
 	sb.WriteString(fmt.Sprintf("CREATE TABLE  IF NOT EXISTS %s (\n", tableName))
 	sb.WriteString("    id SERIAL PRIMARY KEY,\n")
@@ -158,14 +164,15 @@ func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) er
 		case f.IsRepeated():
 			continue
 		case f.GetType() == descriptor.FieldDescriptorProto_TYPE_MESSAGE:
-			if !proto.IsTable(f.GetMessageType()) {
+			mt := proto.TableInfo(f.GetMessageType())
+			if mt == nil {
 				continue
 			}
 			foreignKey := &foreignKey{
 				name:         "fk_" + fieldName(f),
 				table:        tableName,
 				field:        field,
-				foreignTable: tableNameFromDescriptor(s, f.GetMessageType()),
+				foreignTable: TableName(s, mt.Name),
 				foreignField: "id",
 			}
 			c := &Constraint{
@@ -186,7 +193,7 @@ func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) er
 	ones := s.manyToOneRelations[md.GetFullyQualifiedName()]
 	for i, one := range ones {
 		sb.WriteString(",\n")
-		field := fmt.Sprintf("%s_id", strings.ToLower(one))
+		field := strings.ToLower(one.ManyToOnName())
 		sb.WriteString(fmt.Sprintf("    %s %s", field, "INTEGER"))
 
 		if i < len(ones)-1 {
@@ -197,7 +204,7 @@ func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) er
 			name:         "fk_" + field,
 			table:        tableName,
 			field:        field,
-			foreignTable: TableName(s, one),
+			foreignTable: TableName(s, one.Name),
 			foreignField: "id",
 		}
 		c := &Constraint{
@@ -222,11 +229,12 @@ func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) er
 }
 
 func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
-	if !proto.IsTable(d) {
+	t := proto.TableInfo(d)
+	if t == nil {
 		return nil
 	}
 
-	tableName := s.String() + "." + strings.ToLower(d.GetName())
+	tableName := s.String() + "." + strings.ToLower(t.Name)
 	fields := d.GetFields()
 	var fieldNames []string
 	var placeholders []string
@@ -236,7 +244,7 @@ func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
 
 	fieldCount := 1
 	for _, field := range fields {
-		if field.IsRepeated() { //not a direct child
+		if field.IsRepeated() || field.IsExtension() { //not a direct child
 			continue
 		}
 		fieldCount++
@@ -247,7 +255,7 @@ func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
 	ones := s.manyToOneRelations[d.GetFullyQualifiedName()]
 	for _, one := range ones {
 		fieldCount++
-		field := fmt.Sprintf("%s_id", one)
+		field := Quoted(one.ManyToOnName())
 		fieldNames = append(fieldNames, field)
 		placeholders = append(placeholders, fmt.Sprintf("$%d", fieldCount))
 	}
@@ -262,10 +270,10 @@ func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
 	return nil
 }
 
-func (s *Schema) AddManyToOneRelation(many string, one string) {
+func (s *Schema) AddManyToOneRelation(many string, one *schema.Table) {
 	ones, found := s.manyToOneRelations[many]
 	if !found {
-		s.manyToOneRelations[many] = []string{one}
+		s.manyToOneRelations[many] = []*schema.Table{one}
 	}
 	ones = append(ones, one)
 }
@@ -274,9 +282,6 @@ func (s *Schema) Hash() uint64 {
 	h := fnv.New64a()
 
 	var buf []byte
-	// Hash Name
-	buf = append(buf, []byte(s.String())...)
-	buf = append(buf, []byte(s.moduleOutputType)...)
 
 	// Hash tableCreateStatements
 	for _, sql := range s.tableCreateStatements {
@@ -300,5 +305,5 @@ func (s *Schema) Hash() uint64 {
 }
 
 func (s *Schema) String() string {
-	return fmt.Sprintf("%s_%d", s.Name, s.Version)
+	return fmt.Sprintf("%s", s.Name)
 }

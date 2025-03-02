@@ -1,0 +1,23 @@
+syntax = "proto3";
+import "google/protobuf/descriptor.proto";
+
+package schema;
+option go_package = "github.com/streamingfast/substreams-sink-map-sql/pb/schema";
+
+extend google.protobuf.MessageOptions {
+  Table table = 77701;
+
+}
+
+extend google.protobuf.FieldOptions {
+  Field field = 77702;
+}
+
+message Table {
+  string name = 1;
+  string many_to_one_relation_field_name = 2;
+}
+
+message Field {
+  string name = 3;
+}

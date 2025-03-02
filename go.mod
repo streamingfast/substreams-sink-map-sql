@@ -3,12 +3,18 @@ module github.com/streamingfast/substreams-sink-map-sql
 go 1.23.1
 
 require (
-	github.com/gogo/protobuf v1.3.2
+	github.com/fergusstrange/embedded-postgres v1.30.0
 	github.com/golang/protobuf v1.5.4
 	github.com/jhump/protoreflect v1.17.0
+	github.com/jmoiron/sqlx v1.4.0
 	github.com/lib/pq v1.10.9
+	github.com/spf13/cobra v1.7.0
+	github.com/streamingfast/bstream v0.0.2-0.20240906151250-c7bc58efc760
+	github.com/streamingfast/cli v0.0.4-0.20230825151644-8cc84512cd80
 	github.com/streamingfast/logging v0.0.0-20230608130331-f22c91403091
+	github.com/streamingfast/substreams v1.10.3
 	github.com/streamingfast/substreams-sink v0.4.2
+	github.com/test-go/testify v1.1.4
 	go.uber.org/zap v1.27.0
 	google.golang.org/protobuf v1.34.2
 )
@@ -73,12 +79,9 @@ require (
 	github.com/sethvargo/go-retry v0.2.3 // indirect
 	github.com/spf13/afero v1.10.0 // indirect
 	github.com/spf13/cast v1.5.0 // indirect
-	github.com/spf13/cobra v1.7.0 // indirect
 	github.com/spf13/jwalterweatherman v1.1.0 // indirect
 	github.com/spf13/pflag v1.0.5 // indirect
 	github.com/spf13/viper v1.15.0 // indirect
-	github.com/streamingfast/bstream v0.0.2-0.20240906151250-c7bc58efc760 // indirect
-	github.com/streamingfast/cli v0.0.4-0.20230825151644-8cc84512cd80 // indirect
 	github.com/streamingfast/dbin v0.9.1-0.20231117225723-59790c798e2c // indirect
 	github.com/streamingfast/derr v0.0.0-20230515163924-8570aaa43fe1 // indirect
 	github.com/streamingfast/dgrpc v0.0.0-20240219152146-57bb131c39ca // indirect
@@ -87,10 +90,10 @@ require (
 	github.com/streamingfast/opaque v0.0.0-20210811180740-0c01d37ea308 // indirect
 	github.com/streamingfast/pbgo v0.0.6-0.20240823134334-812f6a16c5cb // indirect
 	github.com/streamingfast/shutter v1.5.0 // indirect
-	github.com/streamingfast/substreams v1.10.3 // indirect
-	github.com/stretchr/testify v1.9.0 // indirect
+	github.com/stretchr/testify v1.10.0 // indirect
 	github.com/subosito/gotenv v1.4.2 // indirect
 	github.com/teris-io/shortid v0.0.0-20171029131806-771a37caa5cf // indirect
+	github.com/xi2/xz v0.0.0-20171230120015-48954b6210f8 // indirect
 	github.com/yourbasic/graph v0.0.0-20210606180040-8ecfec1c2869 // indirect
 	go.opencensus.io v0.24.0 // indirect
 	go.opentelemetry.io/contrib/instrumentation/google.golang.org/grpc/otelgrpc v0.49.0 // indirect
