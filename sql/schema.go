@@ -7,7 +7,6 @@ import (
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
 	"github.com/jhump/protoreflect/desc"
-	"github.com/streamingfast/substreams-sink-map-sql/pb/schema"
 	"github.com/streamingfast/substreams-sink-map-sql/proto"
 	"go.uber.org/zap"
 )
@@ -33,12 +32,13 @@ const static_sql = `
 
 type Schema struct {
 	Name                  string
+	tableRegistry         map[string]*Table
 	tableCreateStatements map[string]string
 	constraintStatements  []*Constraint
 	insertSql             map[string]string
-	manyToOneRelations    map[string][]*schema.Table
 	moduleOutputType      string
 	fileDescriptor        *desc.FileDescriptor
+	logger                *zap.Logger
 }
 
 func NewSchema(name string, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Schema, error) {
@@ -47,8 +47,10 @@ func NewSchema(name string, moduleOutputType string, descriptor *desc.FileDescri
 		moduleOutputType:      moduleOutputType,
 		fileDescriptor:        descriptor,
 		insertSql:             make(map[string]string),
-		manyToOneRelations:    make(map[string][]*schema.Table),
 		tableCreateStatements: make(map[string]string),
+		tableRegistry:         make(map[string]*Table),
+		constraintStatements:  make([]*Constraint, 0),
+		logger:                logger,
 	}
 
 	err := s.init()
@@ -69,43 +71,42 @@ func (s *Schema) init() error {
 
 	for _, messageDescriptor := range s.fileDescriptor.GetMessageTypes() {
 		name := messageDescriptor.GetFullyQualifiedName()
+		println("init: checking message descriptor ", name, " for outputs")
 		if name == s.moduleOutputType {
 
 			err := s.walkMessageDescriptor(messageDescriptor, func(md *desc.MessageDescriptor) error {
-				for _, f := range md.GetFields() {
-					t := proto.TableInfo(md)
-					if f.IsRepeated() && t != nil {
-						s.AddManyToOneRelation(f.GetMessageType().GetFullyQualifiedName(), t)
-					}
+				tableInfo := proto.TableInfo(md)
+				if tableInfo == nil {
+					return nil
 				}
+				if _, found := s.tableRegistry[tableInfo.Name]; found {
+					return nil
+				}
+				table, err := NewTable(md)
+				if err != nil {
+					return fmt.Errorf("creating table message descriptor: %w", err)
+				}
+				s.tableRegistry[tableInfo.Name] = table
 				return nil
 			})
 
 			if err != nil {
-				return fmt.Errorf("extracting table relations  %q: %w", messageDescriptor.GetName(), err)
+				return fmt.Errorf("walking and creating table message descriptors registry: %q: %w", messageDescriptor.GetName(), err)
 			}
 
-			err = s.walkMessageDescriptor(messageDescriptor, func(md *desc.MessageDescriptor) error {
-				err := s.createTableFromMessageDescriptor(md)
+			for _, table := range s.tableRegistry {
+				err := s.createTableStatement(table)
 				if err != nil {
-					return fmt.Errorf("walking and creating create statement: %q: %w", md.GetName(), err)
+					return fmt.Errorf("creating create table statement for table %q: %w", table.Name, err)
 				}
-				return nil
-			})
 
-			if err != nil {
-				return err
 			}
 
-			err = s.walkMessageDescriptor(messageDescriptor, func(messageDescriptor *desc.MessageDescriptor) error {
-				err := s.createInsertFromDescriptor(messageDescriptor)
+			for _, table := range s.tableRegistry {
+				err := s.createInsertFromDescriptor(table)
 				if err != nil {
-					return fmt.Errorf("walking and creating insert statement: %q: %w", messageDescriptor.GetName(), err)
+					return fmt.Errorf("walking and creating insert statement: %q: %w", table.Name, err)
 				}
-				return nil
-			})
-			if err != nil {
-				return err
 			}
 
 			foundOutputs = true
@@ -137,43 +138,120 @@ func (s *Schema) walkMessageDescriptor(md *desc.MessageDescriptor, task func(md 
 	return nil
 }
 
-func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) error {
-	t := proto.TableInfo(md)
-	isTable := t != nil
-	if !isTable {
-		return nil
-	}
-
-	if _, found := s.tableCreateStatements[t.Name]; found {
+func (s *Schema) createTableStatement(table *Table) error {
+	if _, found := s.tableCreateStatements[table.FullName(s)]; found {
 		return nil
 	}
 
 	var sb strings.Builder
 
-	tableName := TableName(s, t.Name)
+	tableName := table.FullName(s)
 
-	sb.WriteString(fmt.Sprintf("CREATE TABLE  IF NOT EXISTS %s (\n", tableName))
-	sb.WriteString("    id SERIAL PRIMARY KEY,\n")
-	sb.WriteString("    block_number INTEGER NOT NULL,\n")
+	//todo: reserve table name "_block and _cursor"
 
-	for _, f := range md.GetFields() {
-		field := fieldQuotedName(f)
-		fieldType := mapFieldType(f)
+	sb.WriteString(fmt.Sprintf("CREATE TABLE  IF NOT EXISTS %s (", tableName))
+	var primaryKeyFieldName string
+	if table.PrimaryKey == nil {
+		sb.WriteString("id SERIAL PRIMARY KEY,")
+	} else {
+		pk := table.PrimaryKey
+		primaryKeyFieldName = pk.Name
+		sb.WriteString(fmt.Sprintf("%s %s PRIMARY KEY,", pk.Name, pk.DataType))
+	}
+
+	sb.WriteString(" block_number INTEGER NOT NULL,")
+
+	if table.ChildOf != nil {
+		parentTable, parentFound := s.tableRegistry[table.ChildOf.ParentTable]
+		if !parentFound {
+			return fmt.Errorf("parent table %q not found", table.Name)
+		}
+		fieldFound := false
+		for _, parentField := range parentTable.Fields {
+
+			if parentField.Name == table.ChildOf.ParentTableField {
+
+				sb.WriteString(fmt.Sprintf("%s %s NOT NULL,", parentField.Name, parentField.DataType))
+
+				foreignKey := &foreignKey{
+					name:         "fk_" + table.ChildOf.ParentTable,
+					table:        tableName,
+					field:        table.ChildOf.ParentTableField,
+					foreignTable: parentTable.FullName(s),
+					foreignField: parentField.Name,
+				}
+				c := &Constraint{
+					table: tableName,
+					sql:   foreignKey.String(),
+				}
+				s.constraintStatements = append(s.constraintStatements, c)
+
+				fieldFound = true
+				break
+			}
+		}
+		if !fieldFound {
+			return fmt.Errorf("field %q not found in table %q", table.ChildOf.ParentTableField, table.ChildOf.ParentTable)
+		}
+	}
+
+	//todo: reserve field name "_ID"
+	//todo: rename field "id" to "_ID since it is for internal use
+
+	for _, f := range table.Fields {
+		if f.Name == primaryKeyFieldName {
+			continue
+		}
+
+		fieldName := f.Name
+		fieldType := f.DataType
+		if f.IsUnique {
+			fieldType = fieldType + " UNIQUE"
+		}
 
 		switch {
-		case f.IsRepeated():
+		case f.IsRepeated:
 			continue
-		case f.GetType() == descriptor.FieldDescriptorProto_TYPE_MESSAGE:
-			mt := proto.TableInfo(f.GetMessageType())
-			if mt == nil {
+		case f.IsMessage:
+			childTable, found := s.tableRegistry[f.Message]
+			if !found {
 				continue
 			}
 			foreignKey := &foreignKey{
-				name:         "fk_" + fieldName(f),
+				name:         "fk_" + childTable.Name,
 				table:        tableName,
-				field:        field,
-				foreignTable: TableName(s, mt.Name),
-				foreignField: "id",
+				field:        f.Name,
+				foreignTable: childTable.FullName(s),
+				foreignField: childTable.PrimaryKey.Name,
+			}
+			c := &Constraint{
+				table: tableName,
+				sql:   foreignKey.String(),
+			}
+			s.constraintStatements = append(s.constraintStatements, c)
+		case f.ForeignKey != nil:
+			foreignTable, found := s.tableRegistry[f.ForeignKey.Table]
+			if !found {
+				return fmt.Errorf("foreign table %q not found", f.ForeignKey.Table)
+			}
+
+			var foreignField *Field
+			for _, field := range foreignTable.Fields {
+				if field.Name == f.ForeignKey.TableField {
+					foreignField = field
+					break
+				}
+			}
+			if foreignField == nil {
+				return fmt.Errorf("foreign field %q not found in table %q", f.ForeignKey.TableField, f.ForeignKey.Table)
+			}
+
+			foreignKey := &foreignKey{
+				name:         "fk_" + f.Name,
+				table:        tableName,
+				field:        f.Name,
+				foreignTable: foreignTable.FullName(s),
+				foreignField: foreignField.Name,
 			}
 			c := &Constraint{
 				table: tableName,
@@ -181,101 +259,80 @@ func (s *Schema) createTableFromMessageDescriptor(md *desc.MessageDescriptor) er
 			}
 			s.constraintStatements = append(s.constraintStatements, c)
 		}
-		sb.WriteString(fmt.Sprintf("    %s %s", field, fieldType))
-		sb.WriteString(",\n")
+		sb.WriteString(fmt.Sprintf("%s %s", fieldName, fieldType))
+		sb.WriteString(",")
 	}
 
+	//removing the last comma since it is complicated to removing it before
 	temp := sb.String()
-	temp = temp[:len(temp)-2]
+	temp = temp[:len(temp)-1]
 	sb = strings.Builder{}
 	sb.WriteString(temp)
 
-	ones := s.manyToOneRelations[md.GetFullyQualifiedName()]
-	for i, one := range ones {
-		sb.WriteString(",\n")
-		field := strings.ToLower(one.ManyToOnName())
-		sb.WriteString(fmt.Sprintf("    %s %s", field, "INTEGER"))
+	sb.WriteString(");\n")
 
-		if i < len(ones)-1 {
-			sb.WriteString(",\n")
-		}
-
-		foreignKey := &foreignKey{
-			name:         "fk_" + field,
-			table:        tableName,
-			field:        field,
-			foreignTable: TableName(s, one.Name),
-			foreignField: "id",
-		}
-		c := &Constraint{
-			table: tableName,
-			sql:   foreignKey.String(),
-		}
-
-		s.constraintStatements = append(s.constraintStatements, c)
-	}
-	sb.WriteString("\n);\n")
-
+	//todo: foreign_key to block table should be indexed
 	c := &Constraint{
 		table: tableName,
 		sql:   fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT fk_block FOREIGN KEY (block_number) REFERENCES %s.block(number)", tableName, s.String()),
 	}
 
 	s.constraintStatements = append(s.constraintStatements, c)
-	s.tableCreateStatements[md.GetFullyQualifiedName()] = sb.String()
+	s.tableCreateStatements[tableName] = sb.String()
 
 	return nil
 
 }
 
-func (s *Schema) createInsertFromDescriptor(d *desc.MessageDescriptor) error {
-	t := proto.TableInfo(d)
-	if t == nil {
-		return nil
-	}
+func (s *Schema) createInsertFromDescriptor(table *Table) error {
+	tableName := table.FullName(s)
+	fields := table.Fields
 
-	tableName := s.String() + "." + strings.ToLower(t.Name)
-	fields := d.GetFields()
 	var fieldNames []string
 	var placeholders []string
 
-	fieldNames = append(fieldNames, "block_number")
-	placeholders = append(placeholders, "$1")
+	fieldCount := 0
+	returningField := "id"
 
-	fieldCount := 1
+	fieldCount++
+	fieldNames = append(fieldNames, "block_number")
+	placeholders = append(placeholders, fmt.Sprintf("$%d", fieldCount))
+
+	if pk := table.PrimaryKey; pk != nil {
+		fieldCount++
+		returningField = pk.Name
+		fieldNames = append(fieldNames, pk.Name)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", fieldCount)) //$1
+	}
+
+	if table.ChildOf != nil {
+		fieldCount++
+		fieldNames = append(fieldNames, table.ChildOf.ParentTableField)
+		placeholders = append(placeholders, fmt.Sprintf("$%d", fieldCount))
+	}
+
 	for _, field := range fields {
-		if field.IsRepeated() || field.IsExtension() { //not a direct child
+		if field.Name == returningField {
+			continue
+		}
+		if field.IsRepeated || field.IsExtension { //not a direct child
 			continue
 		}
 		fieldCount++
-		fieldNames = append(fieldNames, fieldQuotedName(field))
+		fieldNames = append(fieldNames, field.Name)
 		placeholders = append(placeholders, fmt.Sprintf("$%d", fieldCount))
 	}
 
-	ones := s.manyToOneRelations[d.GetFullyQualifiedName()]
-	for _, one := range ones {
-		fieldCount++
-		field := Quoted(one.ManyToOnName())
-		fieldNames = append(fieldNames, field)
-		placeholders = append(placeholders, fmt.Sprintf("$%d", fieldCount))
-	}
-
-	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING id",
+	insertSQL := fmt.Sprintf("INSERT INTO %s (%s) VALUES (%s) RETURNING %s",
 		tableName,
 		strings.Join(fieldNames, ", "),
-		strings.Join(placeholders, ", "))
+		strings.Join(placeholders, ", "),
+		returningField,
+	)
 
-	s.insertSql[d.GetFullyQualifiedName()] = insertSQL
+	s.insertSql[tableName] = insertSQL
 
 	return nil
-}
-
-func (s *Schema) AddManyToOneRelation(many string, one *schema.Table) {
-	ones, found := s.manyToOneRelations[many]
-	if !found {
-		s.manyToOneRelations[many] = []*schema.Table{one}
-	}
-	ones = append(ones, one)
 }
 
 func (s *Schema) Hash() uint64 {

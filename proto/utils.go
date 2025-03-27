@@ -31,3 +31,22 @@ func TableInfo(d *desc.MessageDescriptor) *schema.Table {
 		}
 	}
 }
+
+func FieldInfo(d *desc.FieldDescriptor) *schema.Field {
+	options := d.GetOptions().(*descriptorpb.FieldOptions)
+
+	ext, err := proto.GetExtension(options, schema.E_Field)
+
+	if errors.Is(err, proto.ErrMissingExtension) {
+		return nil
+	} else if err != nil {
+		return nil
+	} else {
+		f, ok := ext.(*schema.Field)
+		if ok {
+			return f
+		} else {
+			return nil
+		}
+	}
+}

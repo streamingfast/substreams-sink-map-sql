@@ -11,7 +11,6 @@ import (
 	"github.com/jhump/protoreflect/dynamic"
 	"github.com/lib/pq"
 	sink "github.com/streamingfast/substreams-sink"
-	"github.com/streamingfast/substreams-sink-map-sql/proto"
 	"go.uber.org/zap"
 )
 
@@ -28,10 +27,10 @@ type Database struct {
 
 func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Database, error) {
 	logger = logger.Named("database")
-	statucSql := fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String(), schema.String())
-	_, err := db.Exec(statucSql)
+	staticSql := fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String(), schema.String())
+	_, err := db.Exec(staticSql)
 	if err != nil {
-		return nil, fmt.Errorf("executing static statucSql: %w\n%s", err, statucSql)
+		return nil, fmt.Errorf("executing static staticSql: %w\n%s", err, staticSql)
 	}
 
 	for _, statement := range schema.tableCreateStatements {
@@ -183,12 +182,17 @@ func (d *Database) processMessage(dm *dynamic.Message, blockNum uint64, blockHas
 	return nil
 }
 
-func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *Parent) (id int, err error) {
-	var fieldValues []any
-	fieldValues = append(fieldValues, d.context.blockNumber)
+func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *Parent) (id interface{}, err error) {
 
 	if dm == nil {
 		return 0, fmt.Errorf("received a nil message")
+	}
+
+	var fieldValues []any
+	fieldValues = append(fieldValues, d.context.blockNumber)
+
+	if parent != nil {
+		fieldValues = append(fieldValues, parent.id)
 	}
 
 	var childs [][]interface{}
@@ -211,25 +215,20 @@ func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *P
 		}
 	}
 
-	if parent != nil {
-		fieldValues = append(fieldValues, parent.id)
-	}
-
 	md := dm.GetMessageDescriptor()
-	id = -1
 	var p *Parent
-	t := proto.TableInfo(md)
-	if t != nil {
-		key := md.GetFullyQualifiedName()
-		stmt, found := d.insertStatements[key]
+	table := d.schema.tableRegistry[md.GetName()]
+	if table != nil {
+		tableFullName := table.FullName(d.schema)
+		stmt, found := d.insertStatements[tableFullName]
 		if !found {
-			return 0, fmt.Errorf("insert statement not found for key %q", key)
+			return 0, fmt.Errorf("insert statement not found for table %q", tableFullName)
 		}
 
 		row := d.tx.Stmt(stmt).QueryRow(fieldValues...)
 		err = row.Err()
 		if err != nil {
-			insert := d.schema.insertSql[dm.GetMessageDescriptor().GetFullyQualifiedName()]
+			insert := d.schema.insertSql[tableFullName]
 			return 0, fmt.Errorf("inserting %q: %w", insert, err)
 		}
 
@@ -259,7 +258,7 @@ func (d *Database) walkMessageDescriptorAndInsert(dm *dynamic.Message, parent *P
 
 type Parent struct {
 	field string
-	id    int
+	id    interface{}
 }
 
 func (d *Database) insertBlock(blockNum uint64, hash string, timestamp time.Time) error {

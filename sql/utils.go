@@ -8,10 +8,6 @@ import (
 	"github.com/jhump/protoreflect/desc"
 )
 
-func TableName(schema *Schema, name string) string {
-	return schema.String() + "." + strings.ToLower(name)
-}
-
 func fieldName(f *desc.FieldDescriptor) string {
 	fieldNameSuffix := ""
 	if f.GetType() == descriptor.FieldDescriptorProto_TYPE_MESSAGE {
