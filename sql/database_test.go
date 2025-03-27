@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/desc/protoparse"
 	"github.com/streamingfast/logging"
 	sink "github.com/streamingfast/substreams-sink"
@@ -20,6 +21,7 @@ func TestDatabase_ProcessEntity(t *testing.T) {
 	// Path to your .proto file
 	//protoFile := "test/hm/hm.proto"
 	protoFile := "test/relations/relations.proto"
+	moduleOutputMessage := "test.relations.Output"
 
 	// Create a new parser
 	parser := protoparse.Parser{}
@@ -32,15 +34,24 @@ func TestDatabase_ProcessEntity(t *testing.T) {
 	}
 
 	// fds is a []*desc.FileDescriptor, we take the first one for simplicity
-	fileDesc := fds[0]
+	fileDescriptor := fds[0]
 
 	// Print the name of the file
-	fmt.Printf("Parsed FileDescriptor: %s\n", fileDesc.GetName())
+	fmt.Printf("Parsed FileDescriptor: %s\n", fileDescriptor.GetName())
 
 	//schema, err := NewSchema("foo", "test.hm.ModuleOutput", fileDesc, logger)
 	//require.NoError(t, err)
 
-	schema, err := NewSchema("rel_test", "test.relations.Output", fileDesc, logger)
+	var rootMessageDescriptor *desc.MessageDescriptor
+	for _, messageDescriptor := range fileDescriptor.GetMessageTypes() {
+		name := messageDescriptor.GetFullyQualifiedName()
+		if name == moduleOutputMessage {
+			rootMessageDescriptor = messageDescriptor
+			break
+		}
+	}
+
+	schema, err := NewSchema("rel_test", rootMessageDescriptor, logger)
 	require.NoError(t, err)
 
 	//pg := embeddedpostgres.NewDatabase(
@@ -60,7 +71,7 @@ func TestDatabase_ProcessEntity(t *testing.T) {
 	db, err := sql.Open("postgres", "dbname=postgres sslmode=disable")
 	require.NoError(t, err)
 
-	database, err := NewDatabase(schema, db, "test.relations.Output", fileDesc, logger)
+	database, err := NewDatabase(schema, db, "test.relations.Output", rootMessageDescriptor, logger)
 	require.NoError(t, err)
 
 	blankCursor, err := sink.NewCursor("")

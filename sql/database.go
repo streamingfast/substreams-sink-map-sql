@@ -15,17 +15,17 @@ import (
 )
 
 type Database struct {
-	context          *Context
-	schema           *Schema
-	db               *sql.DB
-	tx               *sql.Tx
-	logger           *zap.Logger
-	mapOutputType    string
-	descriptor       *desc.FileDescriptor
-	insertStatements map[string]*sql.Stmt
+	context               *Context
+	schema                *Schema
+	db                    *sql.DB
+	tx                    *sql.Tx
+	logger                *zap.Logger
+	mapOutputType         string
+	insertStatements      map[string]*sql.Stmt
+	rootMessageDescriptor *desc.MessageDescriptor
 }
 
-func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Database, error) {
+func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, rootMessageDescriptor *desc.MessageDescriptor, logger *zap.Logger) (*Database, error) {
 	logger = logger.Named("database")
 	staticSql := fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String(), schema.String())
 	_, err := db.Exec(staticSql)
@@ -60,12 +60,12 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, descriptor
 	}
 
 	return &Database{
-		schema:           schema,
-		db:               db,
-		logger:           logger,
-		mapOutputType:    moduleOutputType,
-		descriptor:       descriptor,
-		insertStatements: insertStatements,
+		schema:                schema,
+		db:                    db,
+		logger:                logger,
+		mapOutputType:         moduleOutputType,
+		rootMessageDescriptor: rootMessageDescriptor,
+		insertStatements:      insertStatements,
 	}, nil
 }
 
@@ -145,12 +145,7 @@ func (d *Database) ProcessEntity(data []byte, blockNum uint64, blockHash string,
 	}
 	d.tx = tx
 
-	// Find the message descriptor in the file descriptor
-	md := d.descriptor.FindMessage(d.mapOutputType)
-	if md == nil {
-		return fmt.Errorf("message descriptor not found for %s", d.mapOutputType)
-	}
-
+	md := d.rootMessageDescriptor
 	dm := dynamic.NewMessage(md)
 	err = dm.Unmarshal(data)
 	if err != nil {

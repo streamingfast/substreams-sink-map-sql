@@ -36,16 +36,12 @@ type Schema struct {
 	tableCreateStatements map[string]string
 	constraintStatements  []*Constraint
 	insertSql             map[string]string
-	moduleOutputType      string
-	fileDescriptor        *desc.FileDescriptor
 	logger                *zap.Logger
 }
 
-func NewSchema(name string, moduleOutputType string, descriptor *desc.FileDescriptor, logger *zap.Logger) (*Schema, error) {
+func NewSchema(name string, rootMessageDescriptor *desc.MessageDescriptor, logger *zap.Logger) (*Schema, error) {
 	s := &Schema{
 		Name:                  name,
-		moduleOutputType:      moduleOutputType,
-		fileDescriptor:        descriptor,
 		insertSql:             make(map[string]string),
 		tableCreateStatements: make(map[string]string),
 		tableRegistry:         make(map[string]*Table),
@@ -53,15 +49,14 @@ func NewSchema(name string, moduleOutputType string, descriptor *desc.FileDescri
 		logger:                logger,
 	}
 
-	err := s.init()
+	err := s.init(rootMessageDescriptor)
 	if err != nil {
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
 	return s, nil
 }
 
-func (s *Schema) init() error {
-	foundOutputs := false
+func (s *Schema) init(rootMessageDescriptor *desc.MessageDescriptor) error {
 
 	s.insertSql["block"] =
 		fmt.Sprintf("INSERT INTO %s (number, hash, timestamp) VALUES ($1, $2, $3) RETURNING number", TableName(s, "block"))
@@ -69,52 +64,39 @@ func (s *Schema) init() error {
 	s.insertSql["cursor"] =
 		fmt.Sprintf("INSERT INTO %s (name, cursor) VALUES ($1, $2) ON CONFLICT (name) DO UPDATE SET cursor = $2", TableName(s, "cursor"))
 
-	for _, messageDescriptor := range s.fileDescriptor.GetMessageTypes() {
-		name := messageDescriptor.GetFullyQualifiedName()
-		println("init: checking message descriptor ", name, " for outputs")
-		if name == s.moduleOutputType {
-
-			err := s.walkMessageDescriptor(messageDescriptor, func(md *desc.MessageDescriptor) error {
-				tableInfo := proto.TableInfo(md)
-				if tableInfo == nil {
-					return nil
-				}
-				if _, found := s.tableRegistry[tableInfo.Name]; found {
-					return nil
-				}
-				table, err := NewTable(md)
-				if err != nil {
-					return fmt.Errorf("creating table message descriptor: %w", err)
-				}
-				s.tableRegistry[tableInfo.Name] = table
-				return nil
-			})
-
-			if err != nil {
-				return fmt.Errorf("walking and creating table message descriptors registry: %q: %w", messageDescriptor.GetName(), err)
-			}
-
-			for _, table := range s.tableRegistry {
-				err := s.createTableStatement(table)
-				if err != nil {
-					return fmt.Errorf("creating create table statement for table %q: %w", table.Name, err)
-				}
-
-			}
-
-			for _, table := range s.tableRegistry {
-				err := s.createInsertFromDescriptor(table)
-				if err != nil {
-					return fmt.Errorf("walking and creating insert statement: %q: %w", table.Name, err)
-				}
-			}
-
-			foundOutputs = true
-			break
+	err := s.walkMessageDescriptor(rootMessageDescriptor, func(md *desc.MessageDescriptor) error {
+		tableInfo := proto.TableInfo(md)
+		if tableInfo == nil {
+			return nil
 		}
+		if _, found := s.tableRegistry[tableInfo.Name]; found {
+			return nil
+		}
+		table, err := NewTable(md)
+		if err != nil {
+			return fmt.Errorf("creating table message descriptor: %w", err)
+		}
+		s.tableRegistry[tableInfo.Name] = table
+		return nil
+	})
+
+	if err != nil {
+		return fmt.Errorf("walking and creating table message descriptors registry: %q: %w", rootMessageDescriptor.GetName(), err)
 	}
-	if !foundOutputs {
-		return fmt.Errorf("no outputs message found")
+
+	for _, table := range s.tableRegistry {
+		err := s.createTableStatement(table)
+		if err != nil {
+			return fmt.Errorf("creating create table statement for table %q: %w", table.Name, err)
+		}
+
+	}
+
+	for _, table := range s.tableRegistry {
+		err := s.createInsertFromDescriptor(table)
+		if err != nil {
+			return fmt.Errorf("walking and creating insert statement: %q: %w", table.Name, err)
+		}
 	}
 
 	return nil
