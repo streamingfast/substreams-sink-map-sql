@@ -39,9 +39,6 @@ func TestDatabase_ProcessEntity(t *testing.T) {
 	// Print the name of the file
 	fmt.Printf("Parsed FileDescriptor: %s\n", fileDescriptor.GetName())
 
-	//schema, err := NewSchema("foo", "test.hm.ModuleOutput", fileDesc, logger)
-	//require.NoError(t, err)
-
 	var rootMessageDescriptor *desc.MessageDescriptor
 	for _, messageDescriptor := range fileDescriptor.GetMessageTypes() {
 		name := messageDescriptor.GetFullyQualifiedName()
@@ -54,20 +51,6 @@ func TestDatabase_ProcessEntity(t *testing.T) {
 	schema, err := NewSchema("rel_test", rootMessageDescriptor, logger)
 	require.NoError(t, err)
 
-	//pg := embeddedpostgres.NewDatabase(
-	//	embeddedpostgres.DefaultConfig().
-	//		Database("hm").
-	//		Username("user").
-	//		Password("pwd"),
-	//)
-	//err = pg.Start()
-	//require.NoError(t, err)
-	//defer pg.Stop()
-
-	//db, err := sql.Open("postgres", "dbname=hm user= password= sslmode=disable")
-	//require.NoError(t, err)
-	//dbx, err := sqlx.Open("postgres", "dbname=hm user= password= sslmode=disable")
-	//require.NoError(t, err)
 	db, err := sql.Open("postgres", "dbname=postgres sslmode=disable")
 	require.NoError(t, err)
 
