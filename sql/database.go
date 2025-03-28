@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"hash/fnv"
 	"runtime/debug"
 	"strings"
 	"time"
@@ -37,6 +38,9 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, rootMessag
 	}
 
 	defer func() {
+		if tx == nil {
+			return
+		}
 		if err != nil {
 			_ = tx.Rollback()
 			err = fmt.Errorf("database not created cause by: %w", err)
@@ -45,11 +49,50 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, rootMessag
 		_ = tx.Commit()
 	}()
 
-	sinkInfo, err := getSinkInfo(db, schema)
+	sinkInfo, err := getSinkInfo(db, schema.Name)
 	if err != nil {
 		return nil, fmt.Errorf("fetching sink info: %w", err)
 	}
-	if sinkInfo == nil {
+
+	originalSchemaName := schema.Name
+	generateTempSchema := false
+	if sinkInfo != nil && sinkInfo.SchemaHash != schema.Hash() {
+		fmt.Println("mismatch between schema hash and sink info hash", sinkInfo.SchemaHash, schema.Hash())
+		tempSchemaName := schema.Name + "_" + schema.Hash()
+
+		tempSinkInfo, err := getSinkInfo(db, tempSchemaName)
+		if err != nil {
+			return nil, fmt.Errorf("fetching temp schema sink info: %w", err)
+		}
+		if tempSinkInfo != nil {
+			hash, err := dbHashForSchema(schema.Name, db)
+			if err != nil {
+				return nil, fmt.Errorf("fetching schema %q hash: %w", schema.Name, err)
+			}
+			dbTempHash, err := dbHashForSchema(tempSchemaName, db)
+			if err != nil {
+				return nil, fmt.Errorf("fetching temp schema %q hash: %w", tempSchemaName, err)
+			}
+
+			if hash != dbTempHash {
+				return nil, fmt.Errorf("schema %s and temp schema %s have different hash", schema.Name, tempSchemaName)
+			}
+
+			err = UpdateSinkInfoHash(tx, schema, tempSinkInfo.SchemaHash)
+			if err != nil {
+				return nil, fmt.Errorf("updating sink info hash: %w", err)
+			}
+		} else {
+			err = schema.ChangeName(tempSchemaName)
+			if err != nil {
+				return nil, fmt.Errorf("changing schema name: %w", err)
+			}
+			generateTempSchema = true
+		}
+
+	}
+
+	if sinkInfo == nil || generateTempSchema {
 		fmt.Println("sinkInfo", sinkInfo)
 
 		staticSql := fmt.Sprintf(static_sql, schema.String(), schema.String(), schema.String(), schema.String())
@@ -77,6 +120,17 @@ func NewDatabase(schema *Schema, db *sql.DB, moduleOutputType string, rootMessag
 		if err != nil {
 			return nil, fmt.Errorf("storing sink info: %w", err)
 		}
+	}
+
+	if generateTempSchema {
+		fmt.Println("Adjust schema named", originalSchemaName, "to match", schema.Name+"_temp")
+		err := tx.Commit()
+		tx = nil
+		if err != nil {
+			return nil, fmt.Errorf("committing transaction: %w", err)
+		}
+
+		return nil, fmt.Errorf("schema hash mismatch")
 	}
 
 	insertStatements, err := generateInsertStatements(schema, tx)
@@ -327,12 +381,12 @@ type SinkInfo struct {
 	SchemaHash string `json:"schema_hash"`
 }
 
-func getSinkInfo(db *sql.DB, schema *Schema) (*SinkInfo, error) {
+func getSinkInfo(db *sql.DB, schemaName string) (*SinkInfo, error) {
 
 	query := ""
 	switch db.Driver().(type) {
 	case *pq.Driver:
-		query = fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = 'sink_info')", schema.Name)
+		query = fmt.Sprintf("SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = '%s' AND table_name = 'sink_info')", schemaName)
 		fmt.Println("sink info exist query", query)
 	default:
 		panic(fmt.Sprintf("unsupported database driver %T", db.Driver()))
@@ -349,7 +403,7 @@ func getSinkInfo(db *sql.DB, schema *Schema) (*SinkInfo, error) {
 
 	out := &SinkInfo{}
 
-	err = db.QueryRow(fmt.Sprintf("SELECT schema_hash FROM %s.sink_info", schema.Name)).Scan(&out.SchemaHash)
+	err = db.QueryRow(fmt.Sprintf("SELECT schema_hash FROM %s.sink_info", schemaName)).Scan(&out.SchemaHash)
 	if err != nil {
 		return nil, fmt.Errorf("fetching sync info: %w", err)
 	}
@@ -364,6 +418,14 @@ func StoreSinkInfo(tx *sql.Tx, schema *Schema) error {
 	return nil
 }
 
+func UpdateSinkInfoHash(tx *sql.Tx, schema *Schema, newHash string) error {
+	_, err := tx.Exec(fmt.Sprintf("UPDATE %s.sink_info SET schema_hash = $1", schema.Name), newHash)
+	if err != nil {
+		return fmt.Errorf("updating schema hash: %w", err)
+	}
+	return nil
+}
+
 func isDatabaseReachable(db *sql.DB) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
 	defer cancel()
@@ -372,4 +434,100 @@ func isDatabaseReachable(db *sql.DB) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+func dbHashForSchema(schemaName string, db *sql.DB) (uint64, error) {
+	query := `
+SELECT
+    c.table_name,
+    c.column_name,
+    c.is_nullable,
+    c.data_type,
+    c.character_maximum_length,
+    c.numeric_precision,
+    c.numeric_precision_radix,
+    c.numeric_scale,
+    c.datetime_precision,
+    c.interval_precision,
+    c.is_generated,
+    c.is_updatable,
+    tc.constraint_name,
+    tc.table_name,
+    tc.constraint_type,
+    kcu.column_name,
+    kcu.table_name,
+    kcu.column_name,
+    ccu.constraint_name,
+    ccu.table_name,
+    ccu.column_name
+FROM
+    information_schema.columns c
+        LEFT JOIN
+    information_schema.constraint_column_usage ccu
+    ON c.table_name = ccu.table_name
+        AND c.column_name = ccu.column_name
+        AND c.table_schema = ccu.table_schema
+        LEFT JOIN
+    information_schema.key_column_usage kcu
+    ON ccu.constraint_name = kcu.constraint_name
+        AND c.table_schema = kcu.table_schema
+        LEFT JOIN
+    information_schema.table_constraints tc
+    ON kcu.constraint_name = tc.constraint_name
+        AND kcu.table_schema = tc.table_schema
+WHERE
+    c.table_schema = '%s'
+ORDER BY
+    c.table_name,
+    c.column_name,
+    tc.table_name,
+    tc.constraint_name,
+    kcu.table_name,
+    kcu.column_name,
+    kcu.constraint_name;
+`
+
+	query = fmt.Sprintf(query, schemaName)
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return 0, fmt.Errorf("executing query to compute schema hash: %w", err)
+	}
+	defer rows.Close()
+
+	h := fnv.New64a()
+	columns, err := rows.Columns()
+	if err != nil {
+		return 0, fmt.Errorf("fetching columns for hashing: %w", err)
+	}
+
+	values := make([]interface{}, len(columns))
+	valuePtrs := make([]interface{}, len(columns))
+	for i := range values {
+		valuePtrs[i] = &values[i]
+	}
+
+	for rows.Next() {
+		err = rows.Scan(valuePtrs...)
+		if err != nil {
+			return 0, fmt.Errorf("scanning row for hashing: %w", err)
+		}
+
+		for _, val := range values {
+			var str string
+			if val != nil {
+				str = fmt.Sprintf("%v", val)
+			}
+			_, err = h.Write([]byte(str))
+			if err != nil {
+				return 0, fmt.Errorf("hashing value %q: %w", str, err)
+			}
+		}
+	}
+
+	if err = rows.Err(); err != nil {
+		return 0, fmt.Errorf("iterating rows: %w", err)
+	}
+
+	return h.Sum64(), nil
 }

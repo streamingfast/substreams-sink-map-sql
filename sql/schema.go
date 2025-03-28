@@ -1,8 +1,10 @@
 package sql
 
 import (
+	"encoding/hex"
 	"fmt"
 	"hash/fnv"
+	"sort"
 	"strings"
 
 	"github.com/golang/protobuf/protoc-gen-go/descriptor"
@@ -37,6 +39,7 @@ type Schema struct {
 	constraintStatements  []*Constraint
 	insertSql             map[string]string
 	logger                *zap.Logger
+	rootMessageDescriptor *desc.MessageDescriptor
 }
 
 func NewSchema(name string, rootMessageDescriptor *desc.MessageDescriptor, logger *zap.Logger) (*Schema, error) {
@@ -47,6 +50,7 @@ func NewSchema(name string, rootMessageDescriptor *desc.MessageDescriptor, logge
 		tableRegistry:         make(map[string]*Table),
 		constraintStatements:  make([]*Constraint, 0),
 		logger:                logger,
+		rootMessageDescriptor: rootMessageDescriptor,
 	}
 
 	err := s.init(rootMessageDescriptor)
@@ -54,6 +58,20 @@ func NewSchema(name string, rootMessageDescriptor *desc.MessageDescriptor, logge
 		return nil, fmt.Errorf("initializing schema: %w", err)
 	}
 	return s, nil
+}
+
+func (s *Schema) ChangeName(name string) error {
+	s.Name = name
+	s.insertSql = make(map[string]string)
+	s.tableCreateStatements = make(map[string]string)
+	s.tableRegistry = make(map[string]*Table)
+	s.constraintStatements = make([]*Constraint, 0)
+	err := s.init(s.rootMessageDescriptor)
+	if err != nil {
+		return fmt.Errorf("changing schema name: %w", err)
+	}
+
+	return nil
 }
 
 func (s *Schema) init(rootMessageDescriptor *desc.MessageDescriptor) error {
@@ -311,21 +329,39 @@ func (s *Schema) createInsertFromDescriptor(table *Table) error {
 	return nil
 }
 
-func (s *Schema) Hash() uint64 {
+func (s *Schema) Hash() string {
+
 	h := fnv.New64a()
 
 	var buf []byte
 
 	// Hash tableCreateStatements
+	var sqls []string
 	for _, sql := range s.tableCreateStatements {
+		sqls = append(sqls, sql)
+		//buf = append(buf, []byte(sql)...)
+	}
+
+	sort.Strings(sqls)
+	for _, sql := range sqls {
 		buf = append(buf, []byte(sql)...)
 	}
 
+	var constraints []string
 	for _, constraint := range s.constraintStatements {
-		buf = append(buf, []byte(constraint.sql)...)
+		constraints = append(constraints, constraint.sql)
+	}
+	sort.Strings(constraints)
+	for _, constraint := range constraints {
+		buf = append(buf, []byte(constraint)...)
 	}
 
+	var inserts []string
 	for _, sql := range s.insertSql {
+		inserts = append(inserts, sql)
+	}
+	sort.Strings(inserts)
+	for _, sql := range inserts {
 		buf = append(buf, []byte(sql)...)
 	}
 
@@ -334,7 +370,8 @@ func (s *Schema) Hash() uint64 {
 		panic("unable to write to hash")
 	}
 
-	return h.Sum64()
+	data := h.Sum(nil)
+	return hex.EncodeToString(data)
 }
 
 func (s *Schema) String() string {
