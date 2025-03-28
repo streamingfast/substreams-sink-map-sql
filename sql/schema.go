@@ -15,7 +15,7 @@ const static_sql = `
 	CREATE SCHEMA IF NOT EXISTS "%s";
 
 	CREATE TABLE IF NOT EXISTS "%s".sink_info (
-		hash TEXT PRIMARY KEY
+		schema_hash TEXT PRIMARY KEY
 	);
 
 	CREATE TABLE IF NOT EXISTS "%s".cursor (
@@ -129,8 +129,6 @@ func (s *Schema) createTableStatement(table *Table) error {
 
 	tableName := table.FullName(s)
 
-	//todo: reserve table name "_block and _cursor"
-
 	sb.WriteString(fmt.Sprintf("CREATE TABLE  IF NOT EXISTS %s (", tableName))
 	var primaryKeyFieldName string
 	if table.PrimaryKey == nil {
@@ -176,9 +174,6 @@ func (s *Schema) createTableStatement(table *Table) error {
 			return fmt.Errorf("field %q not found in table %q", table.ChildOf.ParentTableField, table.ChildOf.ParentTable)
 		}
 	}
-
-	//todo: reserve field name "_ID"
-	//todo: rename field "id" to "_ID since it is for internal use
 
 	for _, f := range table.Fields {
 		if f.Name == primaryKeyFieldName {
@@ -253,7 +248,6 @@ func (s *Schema) createTableStatement(table *Table) error {
 
 	sb.WriteString(");\n")
 
-	//todo: foreign_key to block table should be indexed
 	c := &Constraint{
 		table: tableName,
 		sql:   fmt.Sprintf("ALTER TABLE %s ADD CONSTRAINT fk_block FOREIGN KEY (block_number) REFERENCES %s.block(number)", tableName, s.String()),

@@ -8,6 +8,7 @@ import (
 
 	"github.com/jhump/protoreflect/desc"
 	"github.com/jhump/protoreflect/desc/protoparse"
+	_ "github.com/lib/pq"
 	"github.com/streamingfast/logging"
 	sink "github.com/streamingfast/substreams-sink"
 	rel "github.com/streamingfast/substreams-sink-map-sql/pb/test/relations"
